@@ -90,18 +90,52 @@ sudo ./scripts/setup.sh --with-scanbd
 ```
 
 主なオプション:
-- `--with-scanbd`: `scanbd` / `scanbm.socket` の導入・設定・`button_trigger.sh` 配置まで自動化
+- `--with-scanbd`: `scanbd` 導入・`button_trigger.sh` 配置・`inetd` / `scanbm` による Web UI 共存構成まで自動化
 - `--user <USER>`: サービス実行ユーザーを明示指定（既定: `sudo` 呼び出し元ユーザー）
 - `--port <PORT>`: 待受ポートを指定（既定: `8000`）
 - `--skip-os-tuning`: `tmpfs` / `journald` / `zram-tools` の設定をスキップ
 
-セットアップ完了後、初回のみ Google Drive 認証を行います（下記「2. Google Drive API 初回認証」）。
+セットアップ完了後、初回のみ Google Drive 認証を行います（下記「5. Google Drive API 初回認証」）。
 
 ---
 
 ### 手動セットアップ（参考）
 
-#### 1. Python 仮想環境と依存パッケージの導入（`uv`）
+#### 1. OS パッケージ導入とユーザーグループ設定
+
+```bash
+sudo apt-get update
+sudo apt-get install -y sane-utils curl zram-tools
+sudo usermod -aG scanner,plugdev <your-user>
+```
+
+#### 2. eMMC 保護・OS 最適化（`tmpfs` / `journald`）
+
+```bash
+sudo mkdir -p /tmp/dr_c125_jobs
+sudo chmod 1777 /tmp/dr_c125_jobs
+echo "tmpfs /tmp/dr_c125_jobs tmpfs defaults,noatime,size=1500M,mode=1777 0 0" | sudo tee -a /etc/fstab
+sudo mount /tmp/dr_c125_jobs
+
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf "[Journal]\nSystemMaxUse=50M\n" | sudo tee /etc/systemd/journald.conf.d/scanner-size.conf
+sudo systemctl restart systemd-journald
+```
+
+#### 3. SANE 設定（Web UI のみ利用する場合）
+
+不要なバックエンドを無効化し、`canon_dr` のみに絞ることで認識を高速化します（`scanbd` を使う場合は手順 8 で `net` 構成へ切り替えます）。
+
+```bash
+sudo cp -a /etc/sane.d/dll.conf /etc/sane.d/dll.conf.bak
+echo "canon_dr" | sudo tee /etc/sane.d/dll.conf
+if [ -f /etc/sane.d/dll.d/airscan ]; then
+  sudo mv /etc/sane.d/dll.d/airscan /etc/sane.d/dll.d/airscan.disabled
+fi
+scanimage -L   # Canon DR-C125 が検出されることを確認
+```
+
+#### 4. Python 仮想環境と依存パッケージの導入（`uv`）
 
 ```bash
 cd ~/scanner-app
@@ -109,7 +143,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # 未導入の場合
 uv sync --frozen --no-cache
 ```
 
-#### 2. Google Drive API 初回認証
+#### 5. Google Drive API 初回認証
 
 Google Cloud Console で OAuth 同意画面を「本番環境（In Production）」へ公開し、クライアントシークレットを `credentials.json`（`chmod 600`）として配置します。
 
@@ -119,7 +153,7 @@ uv run python auth_drive.py
 uv run python drive_client.py   # 疎通確認（DR-C125_Scans フォルダの取得・作成）
 ```
 
-### 3. シャットダウン権限 (`sudoers`) の設定
+#### 6. シャットダウン権限 (`sudoers`) の設定
 
 `<your-user>` は実行ユーザー名に置き換えてください。
 
@@ -129,7 +163,7 @@ sudo chmod 440 /etc/sudoers.d/scanner-poweroff
 sudo visudo -c
 ```
 
-### 4. `systemd` 常駐化
+#### 7. `systemd` 常駐化
 
 `/etc/systemd/system/dr-c125-scanner.service` を作成します（`<your-user>` は実行ユーザー名に置き換えてください）。
 
@@ -164,15 +198,35 @@ sudo ufw allow 8000/tcp
 
 スマホから `http://<DG-CANPCのIP>:8000` へアクセスして利用します。
 
-### 5. 本体スタートボタン連動 (`scanbd` / 任意)
+#### 8. 本体スタートボタン連動 (`scanbd` / 任意)
 
-1. `scanbd` を導入し、`scripts/button_trigger.sh` に実行権限を付与します。
+`scanbd` は `saned` ユーザーで動作し USB デバイスを常時監視するため、Web UI の `scanimage` と共存させるには `scanbd`（`canon_dr`）＋ `scanimage`（`net` → `localhost`）構成にします。
+
+1. `scanbd` を導入し、トリガースクリプトと設定ファイルを配置します。
    ```bash
-   sudo apt install scanbd
-   chmod +x ~/scanner-app/scripts/button_trigger.sh
+   sudo apt-get install -y scanbd
+   sudo mkdir -p /etc/scanbd/scripts /etc/scanbd/scanner.d
+   sudo install -m 755 ~/scanner-app/scripts/button_trigger.sh /etc/scanbd/scripts/button_trigger.sh
+   sudo cp ~/scanner-app/scripts/scanbd_canon_dr.conf /etc/scanbd/scanner.d/canon_dr.conf
    ```
-2. `scripts/scanbd_canon_dr.conf` の `<your-user>` を書き換えて `/etc/scanbd/scanner.d/canon_dr.conf` へ配置し、`/etc/scanbd/scanbd.conf` から読み込むよう設定します。
-3. Web UI の「本体スタートボタン連動」から、ボタン押下時に実行したいプリセットを選択します。
+2. `/etc/scanbd/scanbd.conf` の末尾に `include` を追加します。
+   ```bash
+   echo 'include(scanner.d/canon_dr.conf)' | sudo tee -a /etc/scanbd/scanbd.conf
+   ```
+3. `scanbd` と SANE クライアントのバックエンドを分離します。
+   ```bash
+   echo "canon_dr" | sudo tee /etc/scanbd/dll.conf
+   echo "net" | sudo tee /etc/sane.d/dll.conf
+   grep -Eq '^[[:space:]]*localhost([[:space:]]|$)' /etc/sane.d/net.conf || echo "localhost" | sudo tee -a /etc/sane.d/net.conf
+   ```
+4. サービスを有効化・再起動します（Ubuntu の `scanbd` パッケージでは `openbsd-inetd` が `/etc/inetd.conf` の `sane-port` で 6566/tcp を待ち受けます）。
+   ```bash
+   sudo systemctl enable --now openbsd-inetd.service 2>/dev/null || true
+   sudo systemctl enable --now scanbd.service
+   sudo systemctl restart scanbd.service
+   ```
+5. Web UI の「本体スタートボタン連動」から、ボタン押下時に実行したいプリセットを選択します。
+   - 動作確認ログ: `journalctl -t dr-c125-button -n 20 --no-pager`
 
 ---
 
@@ -207,4 +261,3 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ## 今後の拡張候補
 
 - **AI 自動ファイル命名**: スキャン 1 ページ目の画像を Gemini API へ送信し、書類の日付・タイトルから PDF ファイル名を自動生成する機能。
-- **本体スタートボタン連動**: `scanbd` を導入し、DR-C125 本体のスタートボタン押下で既定プリセットのスキャン＆Drive 保存を自動実行する機能。

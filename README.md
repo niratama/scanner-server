@@ -59,7 +59,10 @@
 ├── auth_drive.py        # 初回 OAuth 認証用スクリプト（token.json 生成）
 ├── settings_store.py    # 組み込み／カスタムプリセット・前回設定・本体ボタン設定の永続化
 ├── history_store.py     # サーバー側スキャン履歴（history.json）の永続化
+├── pyproject.toml       # Python プロジェクト・依存パッケージ定義（uv 管理）
+├── uv.lock              # 依存バージョンロックファイル
 ├── scripts/
+│   ├── setup.sh              # 自動セットアップスクリプト（OS 最適化・SANE・uv・systemd・scanbd）
 │   ├── button_trigger.sh     # scanbd から呼び出す本体ボタン連動スクリプト
 │   └── scanbd_canon_dr.conf  # scanbd 用 Canon DR-C125 設定サンプル
 ├── tests/
@@ -74,24 +77,46 @@
 
 ## セットアップ手順
 
-### 1. Python 仮想環境と依存パッケージの導入
+### 自動セットアップ（推奨）
+
+`scripts/setup.sh` を実行すると、依存パッケージ導入・eMMC 保護（`tmpfs` / `journald` / `zram-tools`）・SANE 設定・`uv` による `.venv` 構築（`uv sync --frozen --no-cache`）・`sudoers`・`systemd` 常駐化・UFW 許可まで一括で設定できます（冪等実行に対応）。
+
+```bash
+# 基本構成（Web UI のみ）
+sudo ./scripts/setup.sh
+
+# 本体スタートボタン連動（scanbd + scanbm 共存構成）もまとめて設定する場合
+sudo ./scripts/setup.sh --with-scanbd
+```
+
+主なオプション:
+- `--with-scanbd`: `scanbd` / `scanbm.socket` の導入・設定・`button_trigger.sh` 配置まで自動化
+- `--user <USER>`: サービス実行ユーザーを明示指定（既定: `sudo` 呼び出し元ユーザー）
+- `--port <PORT>`: 待受ポートを指定（既定: `8000`）
+- `--skip-os-tuning`: `tmpfs` / `journald` / `zram-tools` の設定をスキップ
+
+セットアップ完了後、初回のみ Google Drive 認証を行います（下記「2. Google Drive API 初回認証」）。
+
+---
+
+### 手動セットアップ（参考）
+
+#### 1. Python 仮想環境と依存パッケージの導入（`uv`）
 
 ```bash
 cd ~/scanner-app
-python3 -m venv .venv
-source .venv/bin/activate
-pip install fastapi uvicorn pillow img2pdf google-api-python-client google-auth-oauthlib
+curl -LsSf https://astral.sh/uv/install.sh | sh   # 未導入の場合
+uv sync --frozen --no-cache
 ```
 
-### 2. Google Drive API 初回認証
+#### 2. Google Drive API 初回認証
 
 Google Cloud Console で OAuth 同意画面を「本番環境（In Production）」へ公開し、クライアントシークレットを `credentials.json`（`chmod 600`）として配置します。
 
 ```bash
 # SSH ポートフォワーディング例: ssh -L 8080:127.0.0.1:8080 <your-user>@<host>
-source .venv/bin/activate
-python auth_drive.py
-python drive_client.py   # 疎通確認（DR-C125_Scans フォルダの取得・作成）
+uv run python auth_drive.py
+uv run python drive_client.py   # 疎通確認（DR-C125_Scans フォルダの取得・作成）
 ```
 
 ### 3. シャットダウン権限 (`sudoers`) の設定

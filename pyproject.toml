@@ -1,0 +1,14 @@
+[project]
+name = "scanner-server"
+version = "0.2.0"
+description = "Web UI and scan pipeline for Canon DR-C125 network scanner to Google Drive"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pillow>=10.0",
+    "img2pdf>=0.5",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+]

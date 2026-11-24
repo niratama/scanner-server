@@ -7,9 +7,15 @@ API_URL="${SCANNER_API_URL:-http://127.0.0.1:8000/api/trigger/button?wait=true}"
 
 logger -t dr-c125-button "Hardware button pressed: triggering scan via ${API_URL}"
 
-if response=$(curl -fsS -X POST "${API_URL}" 2>&1); then
-  logger -t dr-c125-button "Scan completed: ${response}"
+tmp_body="$(mktemp)"
+trap 'rm -f "${tmp_body}"' EXIT
+
+http_code="$(curl -sS -o "${tmp_body}" -w "%{http_code}" -X POST "${API_URL}" 2>&1 || true)"
+body="$(cat "${tmp_body}" 2>/dev/null || true)"
+
+if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
+  logger -t dr-c125-button "Scan completed (HTTP ${http_code}): ${body}"
 else
-  logger -t dr-c125-button "Scan trigger failed: ${response}"
+  logger -t dr-c125-button "Scan trigger failed (HTTP ${http_code}): ${body}"
   exit 1
 fi

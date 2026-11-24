@@ -1,0 +1,20 @@
+# Secrets & local runtime state
+credentials.json
+token.json
+settings.json
+*.json.tmp
+
+# Local handover / scratch docs
+docs/tmp/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS / Windows WSL metadata
+*:Zone.Identifier
+.DS_Store
+Thumbs.db

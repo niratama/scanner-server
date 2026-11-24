@@ -1,0 +1,160 @@
+# DR-C125 ネットワークスキャナー（DG-CANPC + Canon DR-C125）
+
+省電力ミニ PC（Diginnos DG-CANPC）をヘッドレス Ubuntu サーバー化し、USB 接続した **Canon DR-C125** をスマホのブラウザから操作して **両面スキャン → 白紙自動除去 → 画像調整 → PDF 化 → Google Drive 自動保存 → 安全シャットダウン** まで完結させる Web アプリケーションです。
+
+---
+
+## 主な機能
+
+- **プリセット優先のスマホ UI**
+  - ワンタップで切り替えられる組み込みプリセット 5 種類（`標準書類` / `領収書` / `軽量メモ` / `白黒くっきり` / `高精細・写真`）を搭載。
+  - 現在の設定に名前を付けて保存できる **カスタムプリセット**（作成・削除）と、**前回使用した設定の自動復元**（`settings.json` へ永続化）に対応。
+  - 細かい設定は折りたたみの詳細設定セクションから必要なときだけ調整可能。
+- **豊富なスキャン・画像調整オプション**
+  - **解像度**: `150 / 200 / 300 / 400 / 600 dpi`
+  - **カラーモード**: `カラー (Color)` / `グレースケール (Gray)` / `白黒2値 (Lineart)`
+  - **両面 / 片面スキャン**: `ADF Duplex` / `ADF Front`
+  - **白紙自動除去**: ON/OFF ＋ 感度 3 段階（`弱` / `標準` / `強`）
+  - **スキャン補正・検知**: ソフトウェア傾き補正（`--swdeskew`）、機械的傾き補正（`--rollerdeskew`）、余白自動切り抜き（`--swcrop`）、重送検知（`--df-length`）、ホチキス検知（`--stapledetect`）、バッファモード（`--buffermode`）
+  - **画像・PDF 調整**: ページ回転（`0° / 90° / 180° / 270°`）、JPEG 圧縮率（`そのまま(無劣化) / 95% / 85% / 75% / 60%`）、明るさ（`-50 〜 +50`）、コントラスト（`-50 〜 +50`）
+- **Google Drive サブフォルダ管理**
+  - `drive.file` スコープのまま、`DR-C125_Scans` 配下のサブフォルダ一覧取得・選択・新規作成（`2026/領収書` のような階層指定にも対応）が可能。
+- **安全なリモートシャットダウン**
+  - スキャン実行中は多重実行・シャットダウンをロックで防止し、完了後に確認ダイアログ経由で `systemctl poweroff` を実行可能。
+
+---
+
+## 環境・ハードウェア構成
+
+| 項目 | 内容 |
+|---|---|
+| **ホスト機** | Diginnos DG-CANPC（Atom x7-Z8700 / 4GB RAM / 32GB eMMC / 64bit UEFI） |
+| **OS** | Ubuntu (amd64, ヘッドレス運用 / `Asia/Tokyo`) |
+| **スキャナー** | Canon DR-C125（USB ID: `1083:1640`, SANE バックエンド: `canon_dr`） |
+| **作業ディレクトリ** | `~/scanner-app`（仮想環境: `.venv`） |
+| **一時作業領域** | `/tmp/dr_c125_jobs`（`tmpfs` 1.5GB マウントで eMMC 書き込みを抑制） |
+
+### DR-C125 実機仕様・制約
+
+- **A4 サイズの明示指定が必須**: デフォルト高さが US レター（`279.364mm`）のため、A4 下端切れ防止として `--page-width=215.872 --page-height=297 -x 215.872 -y 297` を常時指定しています。
+- **自動サイズ検知 (`--ald`) 非対応**: 最大サイズで読み込み、`--swcrop=yes` で余白を切り抜きます。
+- **デバイス指定 (`-d`) 省略**: `/etc/sane.d/dll.conf` を `canon_dr` のみに限定済みのため、USB バス番号変動の影響を受けないよう `-d` は省略しています。
+- **省メモリ設計**: 白紙判定は縮小グレースケールのヒストグラムで行い、画像調整も 1 ページずつ処理します。未加工時は元画像を再圧縮せず `img2pdf` で無劣化結合します（`Lineart` 時は PNG 出力）。
+
+---
+
+## ファイル構成
+
+```text
+.
+├── app.py               # FastAPI サーバー & スマホ向け HTML UI
+├── scan_pipeline.py     # scanimage 実行・白紙除去・画像調整・PDF 化・アップロード統合
+├── drive_client.py      # Google Drive API クライアント（自動リフレッシュ・サブフォルダ管理・アップロード）
+├── auth_drive.py        # 初回 OAuth 認証用スクリプト（token.json 生成）
+├── settings_store.py    # 組み込み／カスタムプリセットおよび前回設定の永続化
+├── tests/
+│   └── test_scanner.py  # ユニットテスト
+├── credentials.json     # （要配置・非公開）Google Cloud OAuth クライアント認証情報
+├── token.json           # （自動生成・非公開）OAuth トークン
+└── settings.json        # （自動生成）カスタムプリセット・前回設定
+```
+
+---
+
+## セットアップ手順
+
+### 1. Python 仮想環境と依存パッケージの導入
+
+```bash
+cd ~/scanner-app
+python3 -m venv .venv
+source .venv/bin/activate
+pip install fastapi uvicorn pillow img2pdf google-api-python-client google-auth-oauthlib
+```
+
+### 2. Google Drive API 初回認証
+
+Google Cloud Console で OAuth 同意画面を「本番環境（In Production）」へ公開し、クライアントシークレットを `credentials.json`（`chmod 600`）として配置します。
+
+```bash
+# SSH ポートフォワーディング例: ssh -L 8080:127.0.0.1:8080 <your-user>@<host>
+source .venv/bin/activate
+python auth_drive.py
+python drive_client.py   # 疎通確認（DR-C125_Scans フォルダの取得・作成）
+```
+
+### 3. シャットダウン権限 (`sudoers`) の設定
+
+`<your-user>` は実行ユーザー名に置き換えてください。
+
+```bash
+echo "<your-user> ALL=(ALL) NOPASSWD: /usr/bin/systemctl poweroff" | sudo tee /etc/sudoers.d/scanner-poweroff
+sudo chmod 440 /etc/sudoers.d/scanner-poweroff
+sudo visudo -c
+```
+
+### 4. `systemd` 常駐化
+
+`/etc/systemd/system/dr-c125-scanner.service` を作成します（`<your-user>` は実行ユーザー名に置き換えてください）。
+
+```ini
+[Unit]
+Description=Canon DR-C125 Network Scanner Web Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<your-user>
+Group=scanner
+WorkingDirectory=/home/<your-user>/scanner-app
+ExecStart=/home/<your-user>/scanner-app/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+サービスを有効化し、必要に応じてファイアウォールでポート `8000/tcp` を許可します。
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now dr-c125-scanner.service
+sudo systemctl status dr-c125-scanner.service
+# UFW が有効な場合
+sudo ufw allow 8000/tcp
+```
+
+スマホから `http://<DG-CANPCのIP>:8000` へアクセスして利用します。
+
+---
+
+## API エンドポイント
+
+| メソッド | パス | 概要 |
+|---|---|---|
+| `GET` | `/` | スマホ向け Web UI を返却 |
+| `POST` | `/api/scan` | スキャンジョブを開始（前回設定を自動保存） |
+| `GET` | `/api/status` | 実行状態・進捗メッセージ・エラー・直近 10 件の履歴を取得 |
+| `GET` | `/api/settings` | 既定値・前回設定・組み込み／カスタムプリセット一覧を取得 |
+| `POST` | `/api/presets` | カスタムプリセットを保存 |
+| `DELETE` | `/api/presets/{preset_id}` | カスタムプリセットを削除 |
+| `GET` | `/api/folders` | `DR-C125_Scans` 直下のサブフォルダ一覧を取得 |
+| `POST` | `/api/folders` | `DR-C125_Scans` 配下にサブフォルダを作成 |
+| `POST` | `/api/poweroff` | ホスト機を安全にシャットダウン |
+
+---
+
+## テストの実行
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+---
+
+## 今後の拡張候補
+
+- **AI 自動ファイル命名**: スキャン 1 ページ目の画像を Gemini API へ送信し、書類の日付・タイトルから PDF ファイル名を自動生成する機能。
+- **本体スタートボタン連動**: `scanbd` を導入し、DR-C125 本体のスタートボタン押下で既定プリセットのスキャン＆Drive 保存を自動実行する機能。

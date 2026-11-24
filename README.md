@@ -7,16 +7,22 @@
 ## 主な機能
 
 - **プリセット優先のスマホ UI**
-  - ワンタップで切り替えられる組み込みプリセット 5 種類（`標準書類` / `領収書` / `軽量メモ` / `白黒くっきり` / `高精細・写真`）を搭載。
+  - ワンタップで切り替えられる組み込みプリセット 6 種類（`標準書類` / `高精細・両面` / `領収書` / `軽量メモ` / `白黒くっきり` / `高精細・写真`）を搭載。
   - 現在の設定に名前を付けて保存できる **カスタムプリセット**（作成・削除）と、**前回使用した設定の自動復元**（`settings.json` へ永続化）に対応。
   - 細かい設定は折りたたみの詳細設定セクションから必要なときだけ調整可能。
 - **豊富なスキャン・画像調整オプション**
   - **解像度**: `150 / 200 / 300 / 400 / 600 dpi`
   - **カラーモード**: `カラー (Color)` / `グレースケール (Gray)` / `白黒2値 (Lineart)`
+  - **保存形式**: `PDF（複数ページ結合）` / `JPEG（ページごとに画像保存）` / `PNG（無劣化・ページごとに画像保存）`
   - **両面 / 片面スキャン**: `ADF Duplex` / `ADF Front`
   - **白紙自動除去**: ON/OFF ＋ 感度 3 段階（`弱` / `標準` / `強`）
   - **スキャン補正・検知**: ソフトウェア傾き補正（`--swdeskew`）、機械的傾き補正（`--rollerdeskew`）、余白自動切り抜き（`--swcrop`）、重送検知（`--df-length`）、ホチキス検知（`--stapledetect`）、バッファモード（`--buffermode`）
   - **画像・PDF 調整**: ページ回転（`0° / 90° / 180° / 270°`）、JPEG 圧縮率（`そのまま(無劣化) / 95% / 85% / 75% / 60%`）、明るさ（`-50 〜 +50`）、コントラスト（`-50 〜 +50`）
+- **サーバー側スキャン履歴の永続化**
+  - スキャン結果（日時・ファイルリンク・保存先フォルダ・出力形式・ページ数・起動元など）をサーバー側の `history.json` に最大 100 件まで保存し、再起動後もブラウザから参照・クリア可能。
+- **本体スタートボタン連動（プロファイル選択式）**
+  - Web UI から本体ボタン押下時に実行するプリセット（組み込み／カスタムどちらも選択可）をいつでも変更可能。
+  - `scanbd` から `scripts/button_trigger.sh` を呼び出すことで、スキャン完了まで USB 競合を防ぎながら自動実行可能。
 - **Google Drive サブフォルダ管理**
   - `drive.file` スコープのまま、`DR-C125_Scans` 配下のサブフォルダ一覧取得・選択・新規作成（`2026/領収書` のような階層指定にも対応）が可能。
 - **安全なリモートシャットダウン**
@@ -51,12 +57,17 @@
 ├── scan_pipeline.py     # scanimage 実行・白紙除去・画像調整・PDF 化・アップロード統合
 ├── drive_client.py      # Google Drive API クライアント（自動リフレッシュ・サブフォルダ管理・アップロード）
 ├── auth_drive.py        # 初回 OAuth 認証用スクリプト（token.json 生成）
-├── settings_store.py    # 組み込み／カスタムプリセットおよび前回設定の永続化
+├── settings_store.py    # 組み込み／カスタムプリセット・前回設定・本体ボタン設定の永続化
+├── history_store.py     # サーバー側スキャン履歴（history.json）の永続化
+├── scripts/
+│   ├── button_trigger.sh     # scanbd から呼び出す本体ボタン連動スクリプト
+│   └── scanbd_canon_dr.conf  # scanbd 用 Canon DR-C125 設定サンプル
 ├── tests/
 │   └── test_scanner.py  # ユニットテスト
 ├── credentials.json     # （要配置・非公開）Google Cloud OAuth クライアント認証情報
 ├── token.json           # （自動生成・非公開）OAuth トークン
-└── settings.json        # （自動生成）カスタムプリセット・前回設定
+├── settings.json        # （自動生成）カスタムプリセット・前回設定・本体ボタンプロファイル
+└── history.json         # （自動生成）スキャン履歴
 ```
 
 ---
@@ -128,6 +139,16 @@ sudo ufw allow 8000/tcp
 
 スマホから `http://<DG-CANPCのIP>:8000` へアクセスして利用します。
 
+### 5. 本体スタートボタン連動 (`scanbd` / 任意)
+
+1. `scanbd` を導入し、`scripts/button_trigger.sh` に実行権限を付与します。
+   ```bash
+   sudo apt install scanbd
+   chmod +x ~/scanner-app/scripts/button_trigger.sh
+   ```
+2. `scripts/scanbd_canon_dr.conf` の `<your-user>` を書き換えて `/etc/scanbd/scanner.d/canon_dr.conf` へ配置し、`/etc/scanbd/scanbd.conf` から読み込むよう設定します。
+3. Web UI の「本体スタートボタン連動」から、ボタン押下時に実行したいプリセットを選択します。
+
 ---
 
 ## API エンドポイント
@@ -136,8 +157,12 @@ sudo ufw allow 8000/tcp
 |---|---|---|
 | `GET` | `/` | スマホ向け Web UI を返却 |
 | `POST` | `/api/scan` | スキャンジョブを開始（前回設定を自動保存） |
-| `GET` | `/api/status` | 実行状態・進捗メッセージ・エラー・直近 10 件の履歴を取得 |
-| `GET` | `/api/settings` | 既定値・前回設定・組み込み／カスタムプリセット一覧を取得 |
+| `POST` | `/api/trigger/button` | 本体ボタン用に選択済みプリセットでスキャンを実行（`?wait=true` で完了待機） |
+| `GET` | `/api/status` | 実行状態・進捗メッセージ・エラー・直近 20 件の履歴を取得 |
+| `GET` | `/api/history` | サーバー保存済みのスキャン履歴を取得（`?limit=50`） |
+| `DELETE` | `/api/history` | サーバー保存済みのスキャン履歴をクリア |
+| `GET` | `/api/settings` | 既定値・前回設定・組み込み／カスタムプリセット・本体ボタン設定を取得 |
+| `PUT` | `/api/button-preset` | 本体ボタン連動用プリセット ID を更新 |
 | `POST` | `/api/presets` | カスタムプリセットを保存 |
 | `DELETE` | `/api/presets/{preset_id}` | カスタムプリセットを削除 |
 | `GET` | `/api/folders` | `DR-C125_Scans` 直下のサブフォルダ一覧を取得 |

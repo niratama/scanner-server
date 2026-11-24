@@ -128,36 +128,57 @@ def create_subfolder(name: str, service=None) -> dict:
     return {"id": folder_id, "name": normalized, "path": display_path}
 
 
-def upload_pdf(
-    pdf_path: Path,
+def upload_file(
+    file_path: Path,
+    *,
+    mimetype: str,
     upload_name: Optional[str] = None,
     folder_id: Optional[str] = None,
     subfolder: str = "",
+    service=None,
 ) -> dict:
-    """PDF を Google Drive へアップロードし、ファイル ID・閲覧 URL・保存先フォルダ名を返す。"""
-    service = get_drive_service()
+    """任意のファイルを Google Drive へアップロードし、ファイル ID・閲覧 URL・保存先フォルダ名を返す。"""
+    svc = service or get_drive_service()
     if folder_id:
         target_folder_id = folder_id
         folder_label = normalize_subfolder_name(subfolder) or ROOT_FOLDER_NAME
     else:
-        target_folder_id, folder_label = ensure_subfolder(service, subfolder)
+        target_folder_id, folder_label = ensure_subfolder(svc, subfolder)
 
     metadata = {
-        "name": upload_name or pdf_path.name,
+        "name": upload_name or file_path.name,
         "parents": [target_folder_id],
     }
     media = MediaFileUpload(
-        str(pdf_path),
-        mimetype="application/pdf",
+        str(file_path),
+        mimetype=mimetype,
         resumable=True,
     )
     created = (
-        service.files()
+        svc.files()
         .create(body=metadata, media_body=media, fields="id, name, webViewLink")
         .execute()
     )
     created["folder"] = folder_label
     return created
+
+
+def upload_pdf(
+    pdf_path: Path,
+    upload_name: Optional[str] = None,
+    folder_id: Optional[str] = None,
+    subfolder: str = "",
+    service=None,
+) -> dict:
+    """PDF を Google Drive へアップロードし、ファイル ID・閲覧 URL・保存先フォルダ名を返す。"""
+    return upload_file(
+        pdf_path,
+        mimetype="application/pdf",
+        upload_name=upload_name,
+        folder_id=folder_id,
+        subfolder=subfolder,
+        service=service,
+    )
 
 
 if __name__ == "__main__":

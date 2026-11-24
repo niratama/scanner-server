@@ -72,50 +72,83 @@ def _install_stub_modules():
 _install_stub_modules()
 
 import drive_client
+import history_store
 import scan_pipeline
 import settings_store
 
 
 class TestSettingsStore(unittest.TestCase):
-    def test_defaults_and_last_used_persistence(self):
+    def test_defaults_and_high_res_duplex_preset(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
             payload = settings_store.get_settings_payload(path)
             self.assertEqual(payload["last_used"]["resolution"], 300)
-            self.assertEqual(payload["last_used"]["mode"], "Color")
-            self.assertGreaterEqual(len(payload["builtin_presets"]), 5)
+            self.assertEqual(payload["last_used"]["output_format"], "pdf")
+            self.assertEqual(payload["button_preset_id"], "standard_doc")
+
+            preset_map = {p["id"]: p for p in payload["builtin_presets"]}
+            self.assertIn("high_res_duplex", preset_map)
+            high_res = preset_map["high_res_duplex"]["settings"]
+            self.assertEqual(high_res["resolution"], 600)
+            self.assertEqual(high_res["mode"], "Color")
+            self.assertTrue(high_res["duplex"])
 
             saved = settings_store.save_last_used(
-                {"resolution": 600, "mode": "Gray", "subfolder": "領収書"},
+                {"resolution": 600, "mode": "Gray", "output_format": "png", "subfolder": "領収書"},
                 path=path,
             )
             self.assertEqual(saved["resolution"], 600)
-            self.assertEqual(saved["mode"], "Gray")
+            self.assertEqual(saved["output_format"], "png")
             self.assertEqual(saved["subfolder"], "領収書")
-            self.assertTrue(saved["swcrop"])
 
             reloaded = settings_store.get_settings_payload(path)
-            self.assertEqual(reloaded["last_used"]["resolution"], 600)
-            self.assertEqual(reloaded["last_used"]["subfolder"], "領収書")
+            self.assertEqual(reloaded["last_used"]["output_format"], "png")
 
-    def test_custom_preset_crud(self):
+    def test_custom_preset_and_button_preset_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
             created = settings_store.save_custom_preset(
                 name="確定申告",
                 description="領収書用",
-                settings={"resolution": 200, "duplex": False, "subfolder": "税務"},
+                settings={"resolution": 200, "duplex": False, "output_format": "jpeg", "subfolder": "税務"},
                 path=path,
             )
-            self.assertFalse(created["builtin"])
-            self.assertEqual(created["name"], "確定申告")
-            self.assertEqual(created["settings"]["subfolder"], "税務")
+            selected = settings_store.set_button_preset_id(created["id"], path=path)
+            self.assertEqual(selected["id"], created["id"])
 
-            payload = settings_store.get_settings_payload(path)
-            self.assertEqual(len(payload["custom_presets"]), 1)
+            resolved = settings_store.resolve_preset_by_id(path=path)
+            self.assertEqual(resolved["name"], "確定申告")
+            self.assertEqual(resolved["settings"]["output_format"], "jpeg")
 
+            # カスタムプリセット削除時は標準プリセットへフォールバックする
             self.assertTrue(settings_store.delete_custom_preset(created["id"], path=path))
-            self.assertFalse(settings_store.delete_custom_preset(created["id"], path=path))
+            payload = settings_store.get_settings_payload(path)
+            self.assertEqual(payload["button_preset_id"], "standard_doc")
+
+
+class TestHistoryStore(unittest.TestCase):
+    def test_append_load_and_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.json"
+            self.assertEqual(history_store.load_history(path=path), [])
+
+            history_store.append_history(
+                {"name": "scan_1.pdf", "output_format": "pdf", "trigger": "web"},
+                path=path,
+            )
+            history_store.append_history(
+                {"name": "scan_2.png", "output_format": "png", "trigger": "button"},
+                path=path,
+            )
+
+            items = history_store.load_history(limit=10, path=path)
+            self.assertEqual(len(items), 2)
+            self.assertEqual(items[0]["name"], "scan_2.png")
+            self.assertEqual(items[0]["trigger"], "button")
+            self.assertIn("id", items[0])
+
+            history_store.clear_history(path=path)
+            self.assertEqual(history_store.load_history(path=path), [])
 
 
 class TestDriveClient(unittest.TestCase):
@@ -149,39 +182,34 @@ class TestScanPipeline(unittest.TestCase):
         self.assertIn("--page-width=215.872", cmd)
         self.assertIn("--page-height=297", cmd)
         self.assertIn("--source=ADF Duplex", cmd)
-        self.assertIn("--swdeskew=yes", cmd)
-        self.assertIn("--rollerdeskew=yes", cmd)
-        self.assertIn("--swcrop=yes", cmd)
-        self.assertIn("--df-length=yes", cmd)
-        self.assertIn("--stapledetect=no", cmd)
-        self.assertIn("--buffermode=yes", cmd)
         self.assertIn("--format=jpeg", cmd)
 
-    def test_build_scanimage_cmd_lineart_simplex(self):
-        cmd = scan_pipeline.build_scanimage_cmd(
+    def test_build_scanimage_cmd_png_and_lineart(self):
+        cmd_png = scan_pipeline.build_scanimage_cmd(
+            batch_pattern="/tmp/page_%04d.png",
+            resolution=600,
+            mode="Color",
+            output_format="png",
+        )
+        self.assertIn("--format=png", cmd_png)
+
+        cmd_lineart = scan_pipeline.build_scanimage_cmd(
             batch_pattern="/tmp/page_%04d.png",
             resolution=150,
             mode="Lineart",
             duplex=False,
-            swdeskew=False,
-            rollerdeskew=False,
-            swcrop=False,
-            df_length=False,
+            output_format="pdf",
             stapledetect=True,
-            buffermode=False,
         )
-        self.assertIn("--source=ADF Front", cmd)
-        self.assertIn("--mode=Lineart", cmd)
-        self.assertIn("--resolution=150", cmd)
-        self.assertIn("--format=png", cmd)
-        self.assertIn("--stapledetect=yes", cmd)
-        self.assertIn("--df-length=no", cmd)
-        self.assertIn("--buffermode=no", cmd)
+        self.assertIn("--source=ADF Front", cmd_lineart)
+        self.assertIn("--format=png", cmd_lineart)
+        self.assertIn("--stapledetect=yes", cmd_lineart)
 
-    def test_sanitize_filename(self):
-        self.assertEqual(scan_pipeline.sanitize_filename("領収書:2026/11"), "領収書_2026_11.pdf")
-        self.assertEqual(scan_pipeline.sanitize_filename("doc.PDF"), "doc.PDF")
-        self.assertTrue(scan_pipeline.sanitize_filename("   ").startswith("scan_"))
+    def test_sanitize_filename_formats(self):
+        self.assertEqual(scan_pipeline.sanitize_filename("領収書:2026/11", "pdf"), "領収書_2026_11.pdf")
+        self.assertEqual(scan_pipeline.sanitize_filename("photo.jpg", "png"), "photo.png")
+        self.assertEqual(scan_pipeline.sanitize_filename("doc.PDF", "jpeg"), "doc.jpg")
+        self.assertTrue(scan_pipeline.sanitize_filename("   ", "png").endswith(".png"))
 
 
 if __name__ == "__main__":

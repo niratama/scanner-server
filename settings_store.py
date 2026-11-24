@@ -6,10 +6,13 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
+DEFAULT_BUTTON_PRESET_ID = "standard_doc"
+
 DEFAULT_SCAN_SETTINGS: dict[str, Any] = {
     "resolution": 300,
     "mode": "Color",
     "duplex": True,
+    "output_format": "pdf",
     "skip_blank": True,
     "blank_sensitivity": "normal",
     "swdeskew": True,
@@ -29,9 +32,23 @@ BUILTIN_PRESETS: list[dict[str, Any]] = [
     {
         "id": "standard_doc",
         "name": "標準書類",
-        "description": "300dpi・カラー・両面・白紙除去",
+        "description": "300dpi・カラー・両面・PDF",
         "builtin": True,
         "settings": {**DEFAULT_SCAN_SETTINGS},
+    },
+    {
+        "id": "high_res_duplex",
+        "name": "高精細・両面",
+        "description": "600dpi・カラー・両面・無劣化",
+        "builtin": True,
+        "settings": {
+            **DEFAULT_SCAN_SETTINGS,
+            "resolution": 600,
+            "mode": "Color",
+            "duplex": True,
+            "skip_blank": True,
+            "jpeg_quality": 0,
+        },
     },
     {
         "id": "receipt",
@@ -73,12 +90,13 @@ BUILTIN_PRESETS: list[dict[str, Any]] = [
     {
         "id": "high_res_photo",
         "name": "高精細・写真",
-        "description": "600dpi・カラー・片面・無劣化",
+        "description": "600dpi・カラー・片面・PNG",
         "builtin": True,
         "settings": {
             **DEFAULT_SCAN_SETTINGS,
             "resolution": 600,
             "duplex": False,
+            "output_format": "png",
             "skip_blank": False,
             "df_length": False,
             "jpeg_quality": 0,
@@ -98,13 +116,21 @@ def merge_with_defaults(settings: dict[str, Any] | None) -> dict[str, Any]:
 
 def _read_store(path: Path = SETTINGS_PATH) -> dict[str, Any]:
     if not path.exists():
-        return {"last_used": dict(DEFAULT_SCAN_SETTINGS), "custom_presets": []}
+        return {
+            "last_used": dict(DEFAULT_SCAN_SETTINGS),
+            "custom_presets": [],
+            "button_preset_id": DEFAULT_BUTTON_PRESET_ID,
+        }
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("Invalid settings structure")
     except (OSError, ValueError):
-        return {"last_used": dict(DEFAULT_SCAN_SETTINGS), "custom_presets": []}
+        return {
+            "last_used": dict(DEFAULT_SCAN_SETTINGS),
+            "custom_presets": [],
+            "button_preset_id": DEFAULT_BUTTON_PRESET_ID,
+        }
 
     custom_presets = []
     for item in data.get("custom_presets", []):
@@ -119,9 +145,15 @@ def _read_store(path: Path = SETTINGS_PATH) -> dict[str, Any]:
                 }
             )
 
+    button_preset_id = str(data.get("button_preset_id") or DEFAULT_BUTTON_PRESET_ID)
+    valid_ids = {p["id"] for p in BUILTIN_PRESETS} | {p["id"] for p in custom_presets}
+    if button_preset_id not in valid_ids:
+        button_preset_id = DEFAULT_BUTTON_PRESET_ID
+
     return {
         "last_used": merge_with_defaults(data.get("last_used")),
         "custom_presets": custom_presets,
+        "button_preset_id": button_preset_id,
     }
 
 
@@ -138,6 +170,7 @@ def get_settings_payload(path: Path = SETTINGS_PATH) -> dict[str, Any]:
         "last_used": store["last_used"],
         "builtin_presets": BUILTIN_PRESETS,
         "custom_presets": store["custom_presets"],
+        "button_preset_id": store["button_preset_id"],
     }
 
 
@@ -146,6 +179,27 @@ def save_last_used(settings: dict[str, Any], path: Path = SETTINGS_PATH) -> dict
     store["last_used"] = merge_with_defaults(settings)
     _write_store(store, path)
     return store["last_used"]
+
+
+def resolve_preset_by_id(
+    preset_id: str | None = None, path: Path = SETTINGS_PATH
+) -> dict[str, Any]:
+    store = _read_store(path)
+    target_id = preset_id or store["button_preset_id"]
+    for preset in (*BUILTIN_PRESETS, *store["custom_presets"]):
+        if preset["id"] == target_id:
+            return preset
+    return BUILTIN_PRESETS[0]
+
+
+def set_button_preset_id(preset_id: str, path: Path = SETTINGS_PATH) -> dict[str, Any]:
+    store = _read_store(path)
+    for preset in (*BUILTIN_PRESETS, *store["custom_presets"]):
+        if preset["id"] == preset_id:
+            store["button_preset_id"] = preset_id
+            _write_store(store, path)
+            return preset
+    raise ValueError(f"指定されたプリセットが見つかりません: {preset_id}")
 
 
 def save_custom_preset(
@@ -192,5 +246,7 @@ def delete_custom_preset(preset_id: str, path: Path = SETTINGS_PATH) -> bool:
     ]
     if len(store["custom_presets"]) == before:
         return False
+    if store["button_preset_id"] == preset_id:
+        store["button_preset_id"] = DEFAULT_BUTTON_PRESET_ID
     _write_store(store, path)
     return True

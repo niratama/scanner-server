@@ -2,6 +2,7 @@
 credentials.json
 token.json
 settings.json
+history.json
 *.json.tmp
 
 # Local handover / scratch docs

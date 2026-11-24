@@ -1,19 +1,21 @@
 import asyncio
 import subprocess
-from collections import deque
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from drive_client import ROOT_FOLDER_NAME, create_subfolder, list_subfolders
+from history_store import append_history, clear_history, load_history
 from scan_pipeline import run_scan_job
 from settings_store import (
     delete_custom_preset,
     get_settings_payload,
+    resolve_preset_by_id,
     save_custom_preset,
     save_last_used,
+    set_button_preset_id,
 )
 
 app = FastAPI(title="DR-C125 Scanner")
@@ -24,13 +26,13 @@ state = {
     "message": "待機中",
     "last_error": None,
 }
-history: deque = deque(maxlen=10)
 
 
 class ScanSettings(BaseModel):
     resolution: Literal[150, 200, 300, 400, 600] = 300
     mode: Literal["Color", "Gray", "Lineart"] = "Color"
     duplex: bool = True
+    output_format: Literal["pdf", "jpeg", "png"] = "pdf"
     skip_blank: bool = True
     blank_sensitivity: Literal["low", "normal", "high"] = "normal"
     swdeskew: bool = True
@@ -48,6 +50,7 @@ class ScanSettings(BaseModel):
 
 class ScanRequest(ScanSettings):
     filename: str = ""
+    preset_name: str = ""
 
 
 class PresetCreateRequest(BaseModel):
@@ -56,11 +59,20 @@ class PresetCreateRequest(BaseModel):
     settings: ScanSettings
 
 
+class ButtonPresetRequest(BaseModel):
+    preset_id: str
+
+
 class FolderCreateRequest(BaseModel):
     name: str
 
 
-async def _execute_scan(req: ScanRequest) -> None:
+async def _execute_scan(
+    req: ScanRequest,
+    *,
+    trigger: str = "web",
+    preset_name: str = "",
+) -> dict | None:
     def update_msg(msg: str) -> None:
         state["message"] = msg
 
@@ -70,6 +82,7 @@ async def _execute_scan(req: ScanRequest) -> None:
             resolution=req.resolution,
             mode=req.mode,
             duplex=req.duplex,
+            output_format=req.output_format,
             skip_blank=req.skip_blank,
             blank_sensitivity=req.blank_sensitivity,
             swdeskew=req.swdeskew,
@@ -84,16 +97,20 @@ async def _execute_scan(req: ScanRequest) -> None:
             contrast=req.contrast,
             subfolder=req.subfolder,
             filename=req.filename,
+            trigger=trigger,
+            preset_name=preset_name or req.preset_name,
             on_progress=update_msg,
         )
-        history.appendleft(result)
+        saved = append_history(result)
         state["message"] = (
-            f"完了: {result['name']} ({result['kept_pages']}ページ / {result['size_mb']}MB)"
+            f"完了: {saved['name']} ({saved['kept_pages']}ページ / {saved['size_mb']}MB)"
         )
         state["last_error"] = None
+        return saved
     except Exception as e:
         state["message"] = "エラーが発生しました"
         state["last_error"] = str(e)
+        return None
     finally:
         state["running"] = False
         scan_lock.release()
@@ -105,14 +122,50 @@ async def start_scan(req: ScanRequest):
         raise HTTPException(status_code=409, detail="現在スキャン実行中です")
     await scan_lock.acquire()
     try:
-        save_last_used(req.model_dump(exclude={"filename"}))
+        save_last_used(req.model_dump(exclude={"filename", "preset_name"}))
     except OSError:
         pass
     state["running"] = True
     state["message"] = "スキャン開始..."
     state["last_error"] = None
-    asyncio.create_task(_execute_scan(req))
+    asyncio.create_task(_execute_scan(req, trigger="web", preset_name=req.preset_name))
     return {"status": "started"}
+
+
+@app.post("/api/trigger/button")
+async def trigger_button_scan(wait: bool = Query(default=False)):
+    """DR-C125 本体スタートボタン（scanbd 等）から選択済みプロファイルでスキャンを実行する。"""
+    if scan_lock.locked():
+        raise HTTPException(status_code=409, detail="現在スキャン実行中です")
+
+    preset = resolve_preset_by_id()
+    req = ScanRequest(**preset["settings"], filename="", preset_name=preset["name"])
+
+    await scan_lock.acquire()
+    state["running"] = True
+    state["message"] = f"本体ボタン起動 ({preset['name']})..."
+    state["last_error"] = None
+
+    if wait:
+        result = await _execute_scan(req, trigger="button", preset_name=preset["name"])
+        if result is None:
+            raise HTTPException(
+                status_code=500,
+                detail=state["last_error"] or "スキャン中にエラーが発生しました",
+            )
+        return {
+            "status": "completed",
+            "preset_id": preset["id"],
+            "preset_name": preset["name"],
+            "result": result,
+        }
+
+    asyncio.create_task(_execute_scan(req, trigger="button", preset_name=preset["name"]))
+    return {
+        "status": "started",
+        "preset_id": preset["id"],
+        "preset_name": preset["name"],
+    }
 
 
 @app.get("/api/status")
@@ -121,13 +174,33 @@ async def get_status():
         "running": state["running"],
         "message": state["message"],
         "last_error": state["last_error"],
-        "history": list(history),
+        "history": load_history(limit=20),
     }
+
+
+@app.get("/api/history")
+async def get_history(limit: int = Query(default=50, ge=1, le=100)):
+    return {"history": load_history(limit=limit)}
+
+
+@app.delete("/api/history")
+async def delete_history():
+    clear_history()
+    return {"status": "cleared"}
 
 
 @app.get("/api/settings")
 async def get_settings():
     return get_settings_payload()
+
+
+@app.put("/api/button-preset")
+async def update_button_preset(req: ButtonPresetRequest):
+    try:
+        preset = set_button_preset_id(req.preset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"button_preset_id": preset["id"], "preset": preset}
 
 
 @app.post("/api/presets")
@@ -228,6 +301,14 @@ HTML_UI = """<!DOCTYPE html>
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
   }
 
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .card-header h2 { margin: 0; }
+
   .status {
     font-size: 0.95rem;
     padding: 10px 12px;
@@ -308,6 +389,21 @@ HTML_UI = """<!DOCTYPE html>
   .badge.custom {
     background: #fef7e0;
     color: #b06000;
+  }
+  .tag {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: #e8eaed;
+    color: #3c4043;
+    font-weight: 600;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .tag.btn-trigger {
+    background: #e6f4ea;
+    color: #137333;
   }
 
   .preset-grid {
@@ -407,8 +503,8 @@ HTML_UI = """<!DOCTYPE html>
   }
 
   button.small-danger {
-    padding: 6px 10px;
-    font-size: 0.8rem;
+    padding: 5px 10px;
+    font-size: 0.78rem;
     font-weight: 600;
     border: 1px solid var(--danger);
     border-radius: 6px;
@@ -542,6 +638,13 @@ HTML_UI = """<!DOCTYPE html>
     color: var(--muted);
     font-size: 0.8rem;
     margin-top: 2px;
+  }
+  .hist-files {
+    margin-top: 4px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 0.78rem;
   }
   a { color: var(--brand-color); text-decoration: none; font-weight: 600; }
 
@@ -683,7 +786,7 @@ HTML_UI = """<!DOCTYPE html>
       <h2 id="advancedHeading">詳細設定（必要なときだけ調整）</h2>
 
       <details>
-        <summary>基本・画質設定</summary>
+        <summary>基本・画質・保存形式</summary>
         <div class="details-body">
           <div class="row">
             <div>
@@ -705,6 +808,14 @@ HTML_UI = """<!DOCTYPE html>
               </select>
             </div>
           </div>
+
+          <label class="field-label" for="output_format">保存形式</label>
+          <select id="output_format" data-setting="output_format">
+            <option value="pdf" selected>PDF（複数ページを1ファイルに結合）</option>
+            <option value="jpeg">JPEG（ページごとに画像保存）</option>
+            <option value="png">PNG（無劣化・ページごとに画像保存）</option>
+          </select>
+
           <div class="check-list">
             <label class="check-item">
               <input type="checkbox" id="duplex" data-setting="duplex" checked>
@@ -796,11 +907,23 @@ HTML_UI = """<!DOCTYPE html>
           </div>
           <input type="range" id="contrast" data-setting="contrast" min="-50" max="50" step="5" value="0">
 
-          <div class="hint" id="lineartNote" style="display:none;">
-            ※ 白黒2値 (Lineart) では JPEG 圧縮・明るさ・コントラストは無効です。
-          </div>
+          <div class="hint" id="formatNote" style="display:none;"></div>
           <div style="margin-top: 10px;">
             <button type="button" class="secondary" id="resetImageBtn">画像調整をリセット</button>
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>本体スタートボタン連動</summary>
+        <div class="details-body">
+          <label class="field-label" for="buttonPresetSelect">本体ボタン押下時に使うプロファイル</label>
+          <div class="inline-row">
+            <select id="buttonPresetSelect"></select>
+            <button type="button" class="secondary" id="testButtonTriggerBtn">テスト実行</button>
+          </div>
+          <div id="buttonPresetHint" class="hint">
+            DR-C125 本体のスタートボタン（scanbd 連動）を押したときに実行されるプリセットを選択します。
           </div>
         </div>
       </details>
@@ -820,7 +943,10 @@ HTML_UI = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>直近のスキャン履歴</h2>
+    <div class="card-header">
+      <h2>スキャン履歴（サーバー保存）</h2>
+      <button type="button" id="clearHistoryBtn" class="small-danger">履歴をクリア</button>
+    </div>
     <div id="historyList" style="color:var(--muted); font-size:0.9rem;">まだ履歴はありません</div>
   </div>
 
@@ -834,6 +960,15 @@ HTML_UI = """<!DOCTYPE html>
     <form method="dialog" class="dialog-actions">
       <button value="cancel" class="secondary" autofocus>キャンセル</button>
       <button value="confirm" class="danger-solid">電源を切る</button>
+    </form>
+  </dialog>
+
+  <dialog id="clearHistoryDialog" aria-labelledby="clearHistoryTitle">
+    <h1 id="clearHistoryTitle">履歴のクリア</h1>
+    <p>サーバーに保存されているスキャン履歴をすべて削除しますか？（Google Drive 上のファイルは削除されません）</p>
+    <form method="dialog" class="dialog-actions">
+      <button value="cancel" class="secondary" autofocus>キャンセル</button>
+      <button value="confirm" class="danger-solid">削除する</button>
     </form>
   </dialog>
 
@@ -851,7 +986,7 @@ HTML_UI = """<!DOCTYPE html>
 
 <script>
 const SETTING_KEYS = [
-  'resolution', 'mode', 'duplex', 'skip_blank', 'blank_sensitivity',
+  'resolution', 'mode', 'duplex', 'output_format', 'skip_blank', 'blank_sensitivity',
   'swdeskew', 'rollerdeskew', 'swcrop', 'df_length', 'stapledetect',
   'buffermode', 'rotation', 'jpeg_quality', 'brightness', 'contrast', 'subfolder'
 ];
@@ -859,12 +994,14 @@ const SETTING_KEYS = [
 let builtinPresets = [];
 let customPresets = [];
 let activePresetId = null;
+let buttonPresetId = 'standard_doc';
 
 function readSettingsFromUI() {
   return {
     resolution: Number(document.getElementById('resolution').value),
     mode: document.getElementById('mode').value,
     duplex: document.getElementById('duplex').checked,
+    output_format: document.getElementById('output_format').value,
     skip_blank: document.getElementById('skip_blank').checked,
     blank_sensitivity: document.getElementById('blank_sensitivity').value,
     swdeskew: document.getElementById('swdeskew').checked,
@@ -907,10 +1044,21 @@ function syncDependentControls() {
   document.getElementById('blank_sensitivity').disabled = !skipBlank;
 
   const isLineart = document.getElementById('mode').value === 'Lineart';
-  document.getElementById('jpeg_quality').disabled = isLineart;
+  const isPng = document.getElementById('output_format').value === 'png';
+  document.getElementById('jpeg_quality').disabled = isLineart || isPng;
   document.getElementById('brightness').disabled = isLineart;
   document.getElementById('contrast').disabled = isLineart;
-  document.getElementById('lineartNote').style.display = isLineart ? 'block' : 'none';
+
+  const note = document.getElementById('formatNote');
+  if (isLineart) {
+    note.textContent = '※ 白黒2値 (Lineart) では JPEG 圧縮・明るさ・コントラストは無効です。';
+    note.style.display = 'block';
+  } else if (isPng) {
+    note.textContent = '※ PNG 出力は無劣化のため JPEG 圧縮設定は無効です。';
+    note.style.display = 'block';
+  } else {
+    note.style.display = 'none';
+  }
 
   const bEl = document.getElementById('brightness');
   const cEl = document.getElementById('contrast');
@@ -937,10 +1085,13 @@ function renderSummary() {
     `${s.resolution}dpi`,
     modeMap[s.mode] || s.mode,
     s.duplex ? '両面' : '片面',
+    s.output_format.toUpperCase(),
     s.skip_blank ? `白紙除去(${sensMap[s.blank_sensitivity]})` : '白紙除去OFF',
   ];
   if (s.rotation !== 0) parts.push(`回転${s.rotation}°`);
-  if (s.mode !== 'Lineart' && s.jpeg_quality > 0) parts.push(`画質${s.jpeg_quality}%`);
+  if (s.mode !== 'Lineart' && s.output_format !== 'png' && s.jpeg_quality > 0) {
+    parts.push(`画質${s.jpeg_quality}%`);
+  }
   if (s.mode !== 'Lineart' && (s.brightness !== 0 || s.contrast !== 0)) {
     parts.push(`明${s.brightness >= 0 ? '+' : ''}${s.brightness}/濃${s.contrast >= 0 ? '+' : ''}${s.contrast}`);
   }
@@ -968,6 +1119,7 @@ function applySettingsToUI(settings) {
   document.getElementById('resolution').value = String(settings.resolution);
   document.getElementById('mode').value = settings.mode;
   document.getElementById('duplex').checked = Boolean(settings.duplex);
+  document.getElementById('output_format').value = settings.output_format || 'pdf';
   document.getElementById('skip_blank').checked = Boolean(settings.skip_blank);
   document.getElementById('blank_sensitivity').value = settings.blank_sensitivity;
   document.getElementById('swdeskew').checked = Boolean(settings.swdeskew);
@@ -983,6 +1135,21 @@ function applySettingsToUI(settings) {
   document.getElementById('subfolder').value = settings.subfolder || '';
   syncDependentControls();
   renderSummary();
+}
+
+function renderButtonPresetSelect() {
+  const select = document.getElementById('buttonPresetSelect');
+  select.replaceChildren();
+  const all = [...builtinPresets, ...customPresets];
+  for (const preset of all) {
+    const opt = document.createElement('option');
+    opt.value = preset.id;
+    opt.textContent = preset.builtin ? preset.name : `${preset.name} (カスタム)`;
+    select.appendChild(opt);
+  }
+  if (all.some(p => p.id === buttonPresetId)) {
+    select.value = buttonPresetId;
+  }
 }
 
 function renderPresets() {
@@ -1009,6 +1176,8 @@ function renderPresets() {
     btn.addEventListener('click', () => applySettingsToUI(preset.settings));
     grid.appendChild(btn);
   }
+
+  renderButtonPresetSelect();
 
   const list = document.getElementById('customPresetList');
   list.replaceChildren();
@@ -1041,6 +1210,7 @@ async function loadSettings() {
     const data = await res.json();
     builtinPresets = data.builtin_presets || [];
     customPresets = data.custom_presets || [];
+    buttonPresetId = data.button_preset_id || 'standard_doc';
     renderPresets();
     applySettingsToUI(data.last_used || data.defaults);
   } catch (e) {
@@ -1098,6 +1268,18 @@ function renderHistory(items) {
     item.className = 'hist-item';
 
     const titleDiv = document.createElement('div');
+    if (h.output_format) {
+      const fmtTag = document.createElement('span');
+      fmtTag.className = 'tag';
+      fmtTag.textContent = String(h.output_format).toUpperCase();
+      titleDiv.appendChild(fmtTag);
+    }
+    if (h.trigger === 'button') {
+      const btnTag = document.createElement('span');
+      btnTag.className = 'tag btn-trigger';
+      btnTag.textContent = '本体ボタン';
+      titleDiv.appendChild(btnTag);
+    }
     if (h.url) {
       const a = document.createElement('a');
       a.href = h.url;
@@ -1106,15 +1288,34 @@ function renderHistory(items) {
       a.textContent = h.name;
       titleDiv.appendChild(a);
     } else {
-      titleDiv.textContent = h.name;
+      const span = document.createElement('span');
+      span.textContent = h.name;
+      titleDiv.appendChild(span);
     }
 
     const metaDiv = document.createElement('div');
     metaDiv.className = 'hist-meta';
+    const presetPart = h.preset_name ? `[${h.preset_name}] ` : '';
     const folderPart = h.folder ? `📁 ${h.folder} / ` : '';
-    metaDiv.textContent = `${folderPart}${h.finished_at} / ${h.kept_pages}p (白紙除外:${h.removed_blank_pages}) / ${h.size_mb}MB`;
+    metaDiv.textContent = `${presetPart}${folderPart}${h.finished_at} / ${h.kept_pages}p (白紙除外:${h.removed_blank_pages}) / ${h.size_mb}MB`;
 
     item.append(titleDiv, metaDiv);
+
+    if (Array.isArray(h.files) && h.files.length > 1) {
+      const filesDiv = document.createElement('div');
+      filesDiv.className = 'hist-files';
+      h.files.forEach((f, idx) => {
+        if (!f.url) return;
+        const link = document.createElement('a');
+        link.href = f.url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = `p${idx + 1}`;
+        filesDiv.appendChild(link);
+      });
+      item.appendChild(filesDiv);
+    }
+
     hist.appendChild(item);
   }
 }
@@ -1126,6 +1327,7 @@ async function fetchStatus() {
     document.getElementById('statusBox').textContent = data.message;
     document.getElementById('scanBtn').disabled = data.running;
     document.getElementById('powerBtn').disabled = data.running;
+    document.getElementById('testButtonTriggerBtn').disabled = data.running;
     showError(data.last_error);
     renderHistory(data.history);
   } catch (e) {
@@ -1134,9 +1336,12 @@ async function fetchStatus() {
 }
 
 async function startScan() {
+  const settings = readSettingsFromUI();
+  const matched = findMatchingPreset(settings);
   const payload = {
-    ...readSettingsFromUI(),
+    ...settings,
     filename: document.getElementById('filename').value,
+    preset_name: matched ? matched.name : 'カスタム',
   };
   try {
     const res = await fetch('/api/scan', {
@@ -1157,6 +1362,42 @@ async function startScan() {
   }
 }
 
+async function updateButtonPreset(presetId) {
+  const hint = document.getElementById('buttonPresetHint');
+  try {
+    const res = await fetch('/api/button-preset', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset_id: presetId }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showError(data.detail || '本体ボタン設定の更新に失敗しました');
+      return;
+    }
+    buttonPresetId = data.button_preset_id;
+    hint.textContent = `本体ボタン連動プロファイルを「${data.preset.name}」に設定しました。`;
+    showError(null);
+  } catch (e) {
+    showError('本体ボタン設定の更新中に通信エラーが発生しました');
+  }
+}
+
+async function testButtonTrigger() {
+  try {
+    const res = await fetch('/api/trigger/button', { method: 'POST' });
+    if (res.ok) {
+      showError(null);
+      fetchStatus();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      showError(err.detail || '本体ボタンテスト実行に失敗しました');
+    }
+  } catch (e) {
+    showError('サーバーへの通信に失敗しました');
+  }
+}
+
 async function saveCustomPreset() {
   const input = document.getElementById('newPresetName');
   const name = input.value.trim();
@@ -1166,7 +1407,7 @@ async function saveCustomPreset() {
   }
   const settings = readSettingsFromUI();
   const modeMap = { Color: 'カラー', Gray: 'グレー', Lineart: '白黒2値' };
-  const desc = `${settings.resolution}dpi・${modeMap[settings.mode]}・${settings.duplex ? '両面' : '片面'}`;
+  const desc = `${settings.resolution}dpi・${modeMap[settings.mode]}・${settings.duplex ? '両面' : '片面'}・${settings.output_format.toUpperCase()}`;
   try {
     const res = await fetch('/api/presets', {
       method: 'POST',
@@ -1194,6 +1435,9 @@ async function deletePreset(presetId) {
     const res = await fetch(`/api/presets/${encodeURIComponent(presetId)}`, { method: 'DELETE' });
     if (res.ok) {
       customPresets = customPresets.filter(p => p.id !== presetId);
+      if (buttonPresetId === presetId) {
+        buttonPresetId = 'standard_doc';
+      }
       renderPresets();
       renderSummary();
     }
@@ -1231,6 +1475,8 @@ async function createFolder(name) {
 document.getElementById('scanBtn').addEventListener('click', startScan);
 document.getElementById('savePresetBtn').addEventListener('click', saveCustomPreset);
 document.getElementById('refreshFoldersBtn').addEventListener('click', loadFolders);
+document.getElementById('buttonPresetSelect').addEventListener('change', e => updateButtonPreset(e.target.value));
+document.getElementById('testButtonTriggerBtn').addEventListener('click', testButtonTrigger);
 document.getElementById('resetImageBtn').addEventListener('click', () => {
   document.getElementById('rotation').value = '0';
   document.getElementById('jpeg_quality').value = '0';
@@ -1261,6 +1507,19 @@ poweroffDialog.addEventListener('close', async () => {
   const res = await fetch('/api/poweroff', { method: 'POST' });
   if (res.ok) {
     document.getElementById('statusBox').textContent = 'シャットダウンを実行しました。数秒後に電源が切れます。';
+  }
+});
+
+// Clear history modal dialog
+const clearHistoryDialog = document.getElementById('clearHistoryDialog');
+document.getElementById('clearHistoryBtn').addEventListener('click', () => clearHistoryDialog.showModal());
+clearHistoryDialog.addEventListener('close', async () => {
+  const choice = clearHistoryDialog.returnValue;
+  clearHistoryDialog.returnValue = '';
+  if (choice !== 'confirm') return;
+  const res = await fetch('/api/history', { method: 'DELETE' });
+  if (res.ok) {
+    renderHistory([]);
   }
 });
 

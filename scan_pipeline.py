@@ -9,7 +9,7 @@ from typing import Callable, Optional
 import img2pdf
 from PIL import Image, ImageEnhance
 
-from drive_client import upload_pdf
+from drive_client import ensure_subfolder, get_drive_service, upload_file, upload_pdf
 
 JOBS_ROOT = Path("/tmp/dr_c125_jobs")
 
@@ -23,6 +23,12 @@ ROTATION_TRANSPOSE_MAP = {
     90: Image.Transpose.ROTATE_270,
     180: Image.Transpose.ROTATE_180,
     270: Image.Transpose.ROTATE_90,
+}
+
+OUTPUT_FORMAT_META = {
+    "pdf": (".pdf", "application/pdf"),
+    "jpeg": (".jpg", "image/jpeg"),
+    "png": (".png", "image/png"),
 }
 
 
@@ -43,19 +49,30 @@ def is_blank_page(
         return (dark_pixels / total_pixels) < dark_ratio_limit
 
 
-def sanitize_filename(name: str) -> str:
-    """ファイル名に使えない文字を除去し、拡張子 .pdf を整える。"""
+def sanitize_base_name(name: str) -> str:
+    """ファイル名に使えない文字や既知の拡張子を除去し、ベース名を返す。"""
     cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name.strip())
+    cleaned = re.sub(r"\.(pdf|jpe?g|png)$", "", cleaned, flags=re.IGNORECASE).strip()
     if not cleaned:
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         cleaned = f"scan_{now}"
-    if not cleaned.lower().endswith(".pdf"):
-        cleaned += ".pdf"
     return cleaned
+
+
+def sanitize_filename(name: str, output_format: str = "pdf") -> str:
+    """出力形式に応じた安全なファイル名（拡張子付き）を返す。"""
+    ext, _ = OUTPUT_FORMAT_META.get(output_format, OUTPUT_FORMAT_META["pdf"])
+    return f"{sanitize_base_name(name)}{ext}"
 
 
 def _yes_no(flag: bool) -> str:
     return "yes" if flag else "no"
+
+
+def _capture_format(mode: str, output_format: str) -> str:
+    if mode == "Lineart" or output_format == "png":
+        return "png"
+    return "jpeg"
 
 
 def build_scanimage_cmd(
@@ -64,6 +81,7 @@ def build_scanimage_cmd(
     resolution: int = 300,
     mode: str = "Color",
     duplex: bool = True,
+    output_format: str = "pdf",
     swdeskew: bool = True,
     rollerdeskew: bool = True,
     swcrop: bool = True,
@@ -73,7 +91,7 @@ def build_scanimage_cmd(
 ) -> list[str]:
     """DR-C125 実機検証済み仕様に基づき scanimage コマンドを組み立てる。"""
     source = "ADF Duplex" if duplex else "ADF Front"
-    img_format = "png" if mode == "Lineart" else "jpeg"
+    img_format = _capture_format(mode, output_format)
     return [
         "scanimage",
         f"--source={source}",
@@ -104,17 +122,23 @@ def process_page_image(
     contrast: int = 0,
     jpeg_quality: int = 0,
     mode: str = "Color",
+    output_format: str = "pdf",
 ) -> Path:
-    """必要な場合のみ 1 ページずつ回転・明るさ/コントラスト・JPEG 圧縮を適用する。"""
+    """必要な場合のみ 1 ページずつ回転・明るさ/コントラスト・形式変換/圧縮を適用する。"""
     is_lineart = mode == "Lineart"
+    target_is_png = output_format == "png" or (output_format == "pdf" and is_lineart)
+    needs_convert = (target_is_png and img_path.suffix.lower() != ".png") or (
+        (not target_is_png) and img_path.suffix.lower() not in (".jpg", ".jpeg")
+    )
     needs_tone = (not is_lineart) and (brightness != 0 or contrast != 0)
-    needs_quality = (not is_lineart) and (jpeg_quality > 0)
+    needs_quality = (not target_is_png) and (not is_lineart) and (jpeg_quality > 0)
     needs_rotate = rotation in ROTATION_TRANSPOSE_MAP
 
-    if not (needs_rotate or needs_tone or needs_quality):
+    if not (needs_convert or needs_rotate or needs_tone or needs_quality):
         return img_path
 
-    out_path = img_path.with_name(f"proc_{img_path.name}")
+    out_ext = ".png" if target_is_png else ".jpg"
+    out_path = img_path.with_name(f"proc_{img_path.stem}{out_ext}")
     with Image.open(img_path) as img:
         dpi = img.info.get("dpi")
         processed = img.copy()
@@ -136,7 +160,7 @@ def process_page_image(
     if dpi:
         save_kwargs["dpi"] = dpi
 
-    if is_lineart:
+    if target_is_png:
         processed.save(out_path, format="PNG", optimize=True, **save_kwargs)
     else:
         if processed.mode not in ("RGB", "L"):
@@ -158,6 +182,7 @@ def run_scan_job(
     resolution: int = 300,
     mode: str = "Color",
     duplex: bool = True,
+    output_format: str = "pdf",
     skip_blank: bool = True,
     blank_sensitivity: str = "normal",
     swdeskew: bool = True,
@@ -172,25 +197,32 @@ def run_scan_job(
     contrast: int = 0,
     subfolder: str = "",
     filename: str = "",
+    trigger: str = "web",
+    preset_name: str = "",
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    """DR-C125 でスキャンし、白紙除去→画像調整→PDF化→Google Drive 保存まで実行する。"""
+    """DR-C125 でスキャンし、白紙除去→画像調整→PDF/JPEG/PNG 出力→Google Drive 保存まで実行する。"""
 
     def report(msg: str) -> None:
         if on_progress:
             on_progress(msg)
 
+    if output_format not in OUTPUT_FORMAT_META:
+        raise ValueError(f"未対応の出力形式です: {output_format}")
+
     job_dir = JOBS_ROOT / f"job_{uuid.uuid4().hex[:8]}"
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        ext = "png" if mode == "Lineart" else "jpg"
+        cap_fmt = _capture_format(mode, output_format)
+        ext = "png" if cap_fmt == "png" else "jpg"
         batch_pattern = str(job_dir / f"page_%04d.{ext}")
         cmd = build_scanimage_cmd(
             batch_pattern=batch_pattern,
             resolution=resolution,
             mode=mode,
             duplex=duplex,
+            output_format=output_format,
             swdeskew=swdeskew,
             rollerdeskew=rollerdeskew,
             swcrop=swcrop,
@@ -200,7 +232,9 @@ def run_scan_job(
         )
 
         mode_label = {"Color": "カラー", "Gray": "グレー", "Lineart": "白黒2値"}.get(mode, mode)
-        report(f"スキャン中 ({resolution}dpi / {mode_label} / {'両面' if duplex else '片面'})...")
+        report(
+            f"スキャン中 ({resolution}dpi / {mode_label} / {'両面' if duplex else '片面'} / {output_format.upper()})..."
+        )
         proc = subprocess.run(cmd, capture_output=True, text=True)
 
         scanned_files = sorted(job_dir.glob(f"page_*.{ext}"))
@@ -235,48 +269,88 @@ def run_scan_job(
 
         # 画像調整（必要な場合のみ 1 ページずつ処理）
         final_files = []
-        needs_postprocess = (
-            rotation in ROTATION_TRANSPOSE_MAP
-            or (mode != "Lineart" and (brightness != 0 or contrast != 0 or jpeg_quality > 0))
-        )
-        if needs_postprocess:
-            report(f"画像調整中 ({len(kept_files)} ページ)...")
-            for p in kept_files:
-                final_files.append(
-                    process_page_image(
-                        p,
-                        rotation=rotation,
-                        brightness=brightness,
-                        contrast=contrast,
-                        jpeg_quality=jpeg_quality,
-                        mode=mode,
-                    )
-                )
+        for idx, p in enumerate(kept_files, start=1):
+            processed = process_page_image(
+                p,
+                rotation=rotation,
+                brightness=brightness,
+                contrast=contrast,
+                jpeg_quality=jpeg_quality,
+                mode=mode,
+                output_format=output_format,
+            )
+            if processed != p:
+                report(f"画像調整中 ({idx}/{len(kept_files)} ページ)...")
+            final_files.append(processed)
+
+        base_name = sanitize_base_name(filename)
+        finished_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if output_format == "pdf":
+            report(f"PDF 作成中 ({len(final_files)} ページ)...")
+            pdf_name = f"{base_name}.pdf"
+            pdf_path = job_dir / pdf_name
+            with pdf_path.open("wb") as f:
+                f.write(img2pdf.convert([str(p) for p in final_files]))
+
+            total_size_mb = round(pdf_path.stat().st_size / (1024 * 1024), 2)
+            report(f"Google Drive へアップロード中 ({total_size_mb} MB)...")
+            uploaded = upload_pdf(pdf_path, upload_name=pdf_name, subfolder=subfolder)
+            uploaded_files = [
+                {"name": uploaded["name"], "url": uploaded.get("webViewLink", "")}
+            ]
+            folder_label = uploaded.get("folder", "DR-C125_Scans")
+            display_name = uploaded["name"]
+            primary_url = uploaded.get("webViewLink", "")
         else:
-            final_files = kept_files
+            out_ext, mimetype = OUTPUT_FORMAT_META[output_format]
+            total_bytes = sum(p.stat().st_size for p in final_files)
+            total_size_mb = round(total_bytes / (1024 * 1024), 2)
 
-        # PDF 結合（未加工時は元画像を再圧縮せず無劣化で格納）
-        report(f"PDF 作成中 ({len(final_files)} ページ)...")
-        pdf_name = sanitize_filename(filename)
-        pdf_path = job_dir / pdf_name
-        with pdf_path.open("wb") as f:
-            f.write(img2pdf.convert([str(p) for p in final_files]))
+            service = get_drive_service()
+            target_folder_id, folder_label = ensure_subfolder(service, subfolder)
 
-        pdf_size_mb = round(pdf_path.stat().st_size / (1024 * 1024), 2)
+            uploaded_files = []
+            for idx, page_path in enumerate(final_files, start=1):
+                if len(final_files) == 1:
+                    upload_name = f"{base_name}{out_ext}"
+                else:
+                    upload_name = f"{base_name}_{idx:03d}{out_ext}"
+                report(
+                    f"Google Drive へアップロード中 ({idx}/{len(final_files)} ファイル / {total_size_mb} MB)..."
+                )
+                uploaded = upload_file(
+                    page_path,
+                    mimetype=mimetype,
+                    upload_name=upload_name,
+                    folder_id=target_folder_id,
+                    subfolder=subfolder,
+                    service=service,
+                )
+                uploaded_files.append(
+                    {"name": uploaded["name"], "url": uploaded.get("webViewLink", "")}
+                )
 
-        # Google Drive へアップロード
-        report(f"Google Drive へアップロード中 ({pdf_size_mb} MB)...")
-        uploaded = upload_pdf(pdf_path, upload_name=pdf_name, subfolder=subfolder)
+            primary_url = uploaded_files[0]["url"]
+            if len(uploaded_files) == 1:
+                display_name = uploaded_files[0]["name"]
+            else:
+                display_name = f"{uploaded_files[0]['name']} (+{len(uploaded_files) - 1}件)"
 
         return {
-            "name": uploaded["name"],
-            "url": uploaded.get("webViewLink", ""),
-            "folder": uploaded.get("folder", "DR-C125_Scans"),
+            "name": display_name,
+            "url": primary_url,
+            "files": uploaded_files,
+            "file_count": len(uploaded_files),
+            "output_format": output_format,
+            "folder": folder_label,
             "scanned_pages": len(scanned_files),
             "kept_pages": len(final_files),
             "removed_blank_pages": removed_count,
-            "size_mb": pdf_size_mb,
-            "finished_at": datetime.datetime.now().strftime("%H:%M:%S"),
+            "size_mb": total_size_mb,
+            "finished_at": finished_at,
+            "trigger": trigger,
+            "preset_name": preset_name,
         }
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)

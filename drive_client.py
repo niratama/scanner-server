@@ -1,3 +1,7 @@
+import os
+import re
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +15,37 @@ SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_PATH = BASE_DIR / "token.json"
 ROOT_FOLDER_NAME = "DR-C125_Scans"
+MAX_SUBFOLDER_DEPTH = 5
+MAX_SUBFOLDER_SEGMENT_LENGTH = 64
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_TOKEN_REFRESH_LOCK = threading.Lock()
+
+
+def _atomic_write_secret(path: Path, content: str) -> None:
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            os.chmod(tmp_path, 0o600)
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _escape_drive_query_value(value: str) -> str:
@@ -19,32 +54,30 @@ def _escape_drive_query_value(value: str) -> str:
 
 def get_drive_service():
     """token.json を読み込み、期限切れなら自動リフレッシュして Drive クライアントを返す。"""
-    if not TOKEN_PATH.exists():
-        raise FileNotFoundError(
-            f"{TOKEN_PATH} が見つかりません。先に auth_drive.py を実行してください。"
-        )
-
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError as e:
-                raise RuntimeError(
-                    "トークンの自動更新に失敗しました。Google 側で失効した可能性があります。"
-                    "auth_drive.py を再実行してください。"
-                ) from e
-
-            # 書き込み途中の破損を防ぐため一時ファイル経由で差し替え
-            tmp_path = TOKEN_PATH.with_suffix(".json.tmp")
-            tmp_path.write_text(creds.to_json(), encoding="utf-8")
-            tmp_path.chmod(0o600)
-            tmp_path.replace(TOKEN_PATH)
-        else:
-            raise RuntimeError(
-                "有効な refresh_token がありません。auth_drive.py を再実行してください。"
+    with _TOKEN_REFRESH_LOCK:
+        if not TOKEN_PATH.exists():
+            raise FileNotFoundError(
+                "token.json が見つかりません。先に auth_drive.py を実行してください。"
             )
+
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except RefreshError as e:
+                    raise RuntimeError(
+                        "トークンの自動更新に失敗しました。Google 側で失効した可能性があります。"
+                        "auth_drive.py を再実行してください。"
+                    ) from e
+
+                # 0600 権限の一時ファイルへ書き込み後、原子的に差し替える
+                _atomic_write_secret(TOKEN_PATH, creds.to_json())
+            else:
+                raise RuntimeError(
+                    "有効な refresh_token がありません。auth_drive.py を再実行してください。"
+                )
 
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -82,8 +115,19 @@ def ensure_folder(
 
 
 def normalize_subfolder_name(subfolder: str) -> str:
-    """サブフォルダ名を正規化する（前後の空白・スラッシュを除去）。"""
+    """サブフォルダ名を正規化し、不正な文字・階層数・セグメント長を検証する。"""
+    if _CONTROL_CHARS_RE.search(subfolder):
+        raise ValueError("フォルダ名に使用できない制御文字が含まれています。")
     parts = [part.strip() for part in subfolder.replace("\\", "/").split("/") if part.strip()]
+    if len(parts) > MAX_SUBFOLDER_DEPTH:
+        raise ValueError(f"フォルダの階層は最大 {MAX_SUBFOLDER_DEPTH} 階層までです。")
+    for part in parts:
+        if part in (".", ".."):
+            raise ValueError("フォルダ名に '.' や '..' は使用できません。")
+        if len(part) > MAX_SUBFOLDER_SEGMENT_LENGTH:
+            raise ValueError(
+                f"各フォルダ名は {MAX_SUBFOLDER_SEGMENT_LENGTH} 文字以内で入力してください。"
+            )
     return "/".join(parts)
 
 

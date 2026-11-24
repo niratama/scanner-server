@@ -8,14 +8,16 @@ API_URL="${SCANNER_API_URL:-http://127.0.0.1:8000/api/trigger/button?wait=true}"
 logger -t dr-c125-button "Hardware button pressed: triggering scan via ${API_URL}"
 
 tmp_body="$(mktemp)"
-trap 'rm -f "${tmp_body}"' EXIT
+tmp_err="$(mktemp)"
+trap 'rm -f "${tmp_body}" "${tmp_err}"' EXIT
 
-http_code="$(curl -sS -o "${tmp_body}" -w "%{http_code}" -X POST "${API_URL}" 2>&1 || true)"
+http_code="$(curl -sS --connect-timeout 5 --max-time 600 -H "X-Requested-With: scanbd" -o "${tmp_body}" -w "%{http_code}" -X POST "${API_URL}" 2>"${tmp_err}" || true)"
 body="$(cat "${tmp_body}" 2>/dev/null || true)"
+err="$(cat "${tmp_err}" 2>/dev/null || true)"
 
 if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
   logger -t dr-c125-button "Scan completed (HTTP ${http_code}): ${body}"
 else
-  logger -t dr-c125-button "Scan trigger failed (HTTP ${http_code}): ${body}"
+  logger -t dr-c125-button "Scan trigger failed (HTTP ${http_code}): ${err} ${body}"
   exit 1
 fi

@@ -1,12 +1,19 @@
 import asyncio
+import logging
 import subprocess
 from typing import Literal
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from drive_client import ROOT_FOLDER_NAME, create_subfolder, list_subfolders
+from drive_client import (
+    ROOT_FOLDER_NAME,
+    create_subfolder,
+    list_subfolders,
+    normalize_subfolder_name,
+)
 from history_store import append_history, clear_history, load_history
 from scan_pipeline import run_scan_job
 from settings_store import (
@@ -18,11 +25,46 @@ from settings_store import (
     set_button_preset_id,
 )
 
+logger = logging.getLogger("scanner_server")
+
 app = FastAPI(title="DR-C125 Scanner")
+
+STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    if request.method in STATE_CHANGING_METHODS:
+        if not request.headers.get("x-requested-with"):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "不正なリクエストです（CSRF 保護）"},
+            )
+        origin = request.headers.get("origin")
+        if origin:
+            host = request.headers.get("host", "")
+            if urlparse(origin).netloc != host:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "クロスオリジンリクエストは許可されていません"},
+                )
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if "text/html" in response.headers.get("content-type", ""):
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'",
+        )
+    return response
+
 
 scan_lock = asyncio.Lock()
 state = {
     "running": False,
+    "powering_off": False,
     "message": "待機中",
     "last_error": None,
 }
@@ -45,26 +87,26 @@ class ScanSettings(BaseModel):
     jpeg_quality: Literal[0, 60, 75, 85, 95] = 0
     brightness: int = Field(default=0, ge=-50, le=50)
     contrast: int = Field(default=0, ge=-50, le=50)
-    subfolder: str = ""
+    subfolder: str = Field(default="", max_length=200)
 
 
 class ScanRequest(ScanSettings):
-    filename: str = ""
-    preset_name: str = ""
+    filename: str = Field(default="", max_length=120)
+    preset_name: str = Field(default="", max_length=80)
 
 
 class PresetCreateRequest(BaseModel):
-    name: str
-    description: str = ""
+    name: str = Field(min_length=1, max_length=60)
+    description: str = Field(default="", max_length=120)
     settings: ScanSettings
 
 
 class ButtonPresetRequest(BaseModel):
-    preset_id: str
+    preset_id: str = Field(min_length=1, max_length=64)
 
 
 class FolderCreateRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
 
 
 async def _execute_scan(
@@ -107,9 +149,15 @@ async def _execute_scan(
         )
         state["last_error"] = None
         return saved
-    except Exception as e:
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        logger.warning("スキャンジョブが失敗しました: %s", e)
         state["message"] = "エラーが発生しました"
         state["last_error"] = str(e)
+        return None
+    except Exception:
+        logger.exception("スキャン処理中に予期しないエラーが発生しました")
+        state["message"] = "エラーが発生しました"
+        state["last_error"] = "スキャン処理中にエラーが発生しました。サーバーログを確認してください。"
         return None
     finally:
         state["running"] = False
@@ -118,23 +166,38 @@ async def _execute_scan(
 
 @app.post("/api/scan")
 async def start_scan(req: ScanRequest):
+    try:
+        normalize_subfolder_name(req.subfolder)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if state["powering_off"]:
+        raise HTTPException(status_code=409, detail="シャットダウン処理中のためスキャンできません")
     if scan_lock.locked():
         raise HTTPException(status_code=409, detail="現在スキャン実行中です")
+
     await scan_lock.acquire()
     try:
-        save_last_used(req.model_dump(exclude={"filename", "preset_name"}))
-    except OSError:
-        pass
-    state["running"] = True
-    state["message"] = "スキャン開始..."
-    state["last_error"] = None
-    asyncio.create_task(_execute_scan(req, trigger="web", preset_name=req.preset_name))
+        try:
+            save_last_used(req.model_dump(exclude={"filename", "preset_name"}))
+        except OSError:
+            pass
+        state["running"] = True
+        state["message"] = "スキャン開始..."
+        state["last_error"] = None
+        asyncio.create_task(_execute_scan(req, trigger="web", preset_name=req.preset_name))
+    except Exception:
+        state["running"] = False
+        scan_lock.release()
+        raise
     return {"status": "started"}
 
 
 @app.post("/api/trigger/button")
 async def trigger_button_scan(wait: bool = Query(default=False)):
     """DR-C125 本体スタートボタン（scanbd 等）から選択済みプロファイルでスキャンを実行する。"""
+    if state["powering_off"]:
+        raise HTTPException(status_code=409, detail="シャットダウン処理中のためスキャンできません")
     if scan_lock.locked():
         raise HTTPException(status_code=409, detail="現在スキャン実行中です")
 
@@ -142,25 +205,33 @@ async def trigger_button_scan(wait: bool = Query(default=False)):
     req = ScanRequest(**preset["settings"], filename="", preset_name=preset["name"])
 
     await scan_lock.acquire()
-    state["running"] = True
-    state["message"] = f"本体ボタン起動 ({preset['name']})..."
-    state["last_error"] = None
+    try:
+        state["running"] = True
+        state["message"] = f"本体ボタン起動 ({preset['name']})..."
+        state["last_error"] = None
 
-    if wait:
-        result = await _execute_scan(req, trigger="button", preset_name=preset["name"])
-        if result is None:
-            raise HTTPException(
-                status_code=500,
-                detail=state["last_error"] or "スキャン中にエラーが発生しました",
-            )
-        return {
-            "status": "completed",
-            "preset_id": preset["id"],
-            "preset_name": preset["name"],
-            "result": result,
-        }
+        if wait:
+            result = await _execute_scan(req, trigger="button", preset_name=preset["name"])
+            if result is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=state["last_error"] or "スキャン中にエラーが発生しました",
+                )
+            return {
+                "status": "completed",
+                "preset_id": preset["id"],
+                "preset_name": preset["name"],
+                "result": result,
+            }
 
-    asyncio.create_task(_execute_scan(req, trigger="button", preset_name=preset["name"]))
+        asyncio.create_task(_execute_scan(req, trigger="button", preset_name=preset["name"]))
+    except HTTPException:
+        raise
+    except Exception:
+        state["running"] = False
+        if scan_lock.locked():
+            scan_lock.release()
+        raise
     return {
         "status": "started",
         "preset_id": preset["id"],
@@ -172,6 +243,7 @@ async def trigger_button_scan(wait: bool = Query(default=False)):
 async def get_status():
     return {
         "running": state["running"],
+        "powering_off": state["powering_off"],
         "message": state["message"],
         "last_error": state["last_error"],
         "history": load_history(limit=20),
@@ -229,8 +301,16 @@ async def get_folders():
     try:
         folders = await asyncio.to_thread(list_subfolders)
         return {"root": ROOT_FOLDER_NAME, "folders": folders, "error": None}
-    except Exception as e:
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.warning("フォルダ一覧取得エラー: %s", e)
         return {"root": ROOT_FOLDER_NAME, "folders": [], "error": str(e)}
+    except Exception:
+        logger.exception("フォルダ一覧取得中に予期しないエラーが発生しました")
+        return {
+            "root": ROOT_FOLDER_NAME,
+            "folders": [],
+            "error": "Google Drive からのフォルダ取得に失敗しました",
+        }
 
 
 @app.post("/api/folders")
@@ -240,18 +320,34 @@ async def add_folder(req: FolderCreateRequest):
         return {"folder": created}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"フォルダ作成に失敗しました: {e}")
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.warning("フォルダ作成エラー: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("フォルダ作成中に予期しないエラーが発生しました")
+        raise HTTPException(
+            status_code=500,
+            detail="フォルダ作成に失敗しました。サーバーログを確認してください。",
+        )
 
 
 @app.post("/api/poweroff")
 async def poweroff():
     if scan_lock.locked():
         raise HTTPException(status_code=409, detail="スキャン実行中のためシャットダウンできません")
+    if state["powering_off"]:
+        raise HTTPException(status_code=409, detail="すでにシャットダウン処理中です")
+
+    state["powering_off"] = True
+    state["message"] = "シャットダウン処理中..."
 
     async def _do_poweroff():
         await asyncio.sleep(1.5)
-        subprocess.run(["sudo", "-n", "/usr/bin/systemctl", "poweroff"], check=False)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["sudo", "-n", "/usr/bin/systemctl", "poweroff"],
+            check=False,
+        )
 
     asyncio.create_task(_do_poweroff())
     return {"status": "powering_off"}
@@ -996,6 +1092,22 @@ let customPresets = [];
 let activePresetId = null;
 let buttonPresetId = 'standard_doc';
 
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('X-Requested-With', 'scanner-ui');
+  return fetch(url, { ...options, headers });
+}
+
+function safeExternalUrl(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function readSettingsFromUI() {
   return {
     resolution: Number(document.getElementById('resolution').value),
@@ -1280,9 +1392,10 @@ function renderHistory(items) {
       btnTag.textContent = '本体ボタン';
       titleDiv.appendChild(btnTag);
     }
-    if (h.url) {
+    const safeUrl = safeExternalUrl(h.url);
+    if (safeUrl) {
       const a = document.createElement('a');
-      a.href = h.url;
+      a.href = safeUrl;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
       a.textContent = h.name;
@@ -1305,9 +1418,10 @@ function renderHistory(items) {
       const filesDiv = document.createElement('div');
       filesDiv.className = 'hist-files';
       h.files.forEach((f, idx) => {
-        if (!f.url) return;
+        const fileHref = safeExternalUrl(f.url);
+        if (!fileHref) return;
         const link = document.createElement('a');
-        link.href = f.url;
+        link.href = fileHref;
         link.target = '_blank';
         link.rel = 'noopener noreferrer';
         link.textContent = `p${idx + 1}`;
@@ -1322,12 +1436,13 @@ function renderHistory(items) {
 
 async function fetchStatus() {
   try {
-    const res = await fetch('/api/status');
+    const res = await apiFetch('/api/status');
     const data = await res.json();
+    const busy = Boolean(data.running || data.powering_off);
     document.getElementById('statusBox').textContent = data.message;
-    document.getElementById('scanBtn').disabled = data.running;
-    document.getElementById('powerBtn').disabled = data.running;
-    document.getElementById('testButtonTriggerBtn').disabled = data.running;
+    document.getElementById('scanBtn').disabled = busy;
+    document.getElementById('powerBtn').disabled = busy;
+    document.getElementById('testButtonTriggerBtn').disabled = busy;
     showError(data.last_error);
     renderHistory(data.history);
   } catch (e) {
@@ -1344,7 +1459,7 @@ async function startScan() {
     preset_name: matched ? matched.name : 'カスタム',
   };
   try {
-    const res = await fetch('/api/scan', {
+    const res = await apiFetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1365,7 +1480,7 @@ async function startScan() {
 async function updateButtonPreset(presetId) {
   const hint = document.getElementById('buttonPresetHint');
   try {
-    const res = await fetch('/api/button-preset', {
+    const res = await apiFetch('/api/button-preset', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ preset_id: presetId }),
@@ -1385,7 +1500,7 @@ async function updateButtonPreset(presetId) {
 
 async function testButtonTrigger() {
   try {
-    const res = await fetch('/api/trigger/button', { method: 'POST' });
+    const res = await apiFetch('/api/trigger/button', { method: 'POST' });
     if (res.ok) {
       showError(null);
       fetchStatus();
@@ -1409,7 +1524,7 @@ async function saveCustomPreset() {
   const modeMap = { Color: 'カラー', Gray: 'グレー', Lineart: '白黒2値' };
   const desc = `${settings.resolution}dpi・${modeMap[settings.mode]}・${settings.duplex ? '両面' : '片面'}・${settings.output_format.toUpperCase()}`;
   try {
-    const res = await fetch('/api/presets', {
+    const res = await apiFetch('/api/presets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, description: desc, settings }),
@@ -1432,7 +1547,7 @@ async function saveCustomPreset() {
 
 async function deletePreset(presetId) {
   try {
-    const res = await fetch(`/api/presets/${encodeURIComponent(presetId)}`, { method: 'DELETE' });
+    const res = await apiFetch(`/api/presets/${encodeURIComponent(presetId)}`, { method: 'DELETE' });
     if (res.ok) {
       customPresets = customPresets.filter(p => p.id !== presetId);
       if (buttonPresetId === presetId) {
@@ -1450,7 +1565,7 @@ async function createFolder(name) {
   const hint = document.getElementById('folderHint');
   hint.textContent = 'フォルダを作成中...';
   try {
-    const res = await fetch('/api/folders', {
+    const res = await apiFetch('/api/folders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -1504,7 +1619,7 @@ poweroffDialog.addEventListener('close', async () => {
   const choice = poweroffDialog.returnValue;
   poweroffDialog.returnValue = '';
   if (choice !== 'confirm') return;
-  const res = await fetch('/api/poweroff', { method: 'POST' });
+  const res = await apiFetch('/api/poweroff', { method: 'POST' });
   if (res.ok) {
     document.getElementById('statusBox').textContent = 'シャットダウンを実行しました。数秒後に電源が切れます。';
   }
@@ -1517,7 +1632,7 @@ clearHistoryDialog.addEventListener('close', async () => {
   const choice = clearHistoryDialog.returnValue;
   clearHistoryDialog.returnValue = '';
   if (choice !== 'confirm') return;
-  const res = await fetch('/api/history', { method: 'DELETE' });
+  const res = await apiFetch('/api/history', { method: 'DELETE' });
   if (res.ok) {
     renderHistory([]);
   }

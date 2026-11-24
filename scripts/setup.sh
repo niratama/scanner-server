@@ -106,13 +106,20 @@ done
 # 3. eMMC 保護・OS 最適化（tmpfs / journald）
 if [[ "${SKIP_OS_TUNING}" -eq 0 ]]; then
   log "3/7 eMMC 保護設定（tmpfs / journald）を適用しています..."
+  APP_UID="$(id -u "${APP_USER}")"
+  SCANNER_GID="$(getent group scanner | cut -d: -f3 || id -g "${APP_USER}")"
   mkdir -p /tmp/dr_c125_jobs
-  chmod 1777 /tmp/dr_c125_jobs
-  FSTAB_LINE="tmpfs /tmp/dr_c125_jobs tmpfs defaults,noatime,size=1500M,mode=1777 0 0"
-  if ! grep -Fq "/tmp/dr_c125_jobs" /etc/fstab; then
+  chown "${APP_UID}:${SCANNER_GID}" /tmp/dr_c125_jobs
+  chmod 0700 /tmp/dr_c125_jobs
+  FSTAB_LINE="tmpfs /tmp/dr_c125_jobs tmpfs defaults,noatime,size=1500M,uid=${APP_UID},gid=${SCANNER_GID},mode=0700 0 0"
+  if grep -Fq "/tmp/dr_c125_jobs" /etc/fstab; then
+    sed -i "s|^tmpfs /tmp/dr_c125_jobs tmpfs .*|${FSTAB_LINE}|" /etc/fstab
+  else
     echo "${FSTAB_LINE}" >> /etc/fstab
   fi
-  if ! mountpoint -q /tmp/dr_c125_jobs; then
+  if mountpoint -q /tmp/dr_c125_jobs; then
+    mount -o "remount,uid=${APP_UID},gid=${SCANNER_GID},mode=0700" /tmp/dr_c125_jobs
+  else
     mount /tmp/dr_c125_jobs
   fi
 
@@ -147,6 +154,7 @@ if [[ "${WITH_SCANBD}" -eq 1 ]]; then
 
   mkdir -p /etc/scanbd/scripts /etc/scanbd/scanner.d
   install -m 755 "${APP_DIR}/scripts/button_trigger.sh" /etc/scanbd/scripts/button_trigger.sh
+  sed -i "s|http://127.0.0.1:8000/api/trigger/button|http://127.0.0.1:${PORT}/api/trigger/button|g" /etc/scanbd/scripts/button_trigger.sh
   cat <<EOF > /etc/scanbd/scanner.d/canon_dr.conf
 device canon_dr {
     filter = "^canon_dr.*"
@@ -176,25 +184,27 @@ fi
 # 5. uv 導入 & Python 仮想環境 (.venv) の同期
 log "5/7 uv を使って Python 仮想環境 (.venv) を構築しています..."
 APP_HOME="$(getent passwd "${APP_USER}" | cut -d: -f6)"
-sudo -u "${APP_USER}" env HOME="${APP_HOME}" bash -euo pipefail -c "
-  export PATH=\"${APP_HOME}/.local/bin:${APP_HOME}/.cargo/bin:\$PATH\"
+sudo -u "${APP_USER}" env HOME="${APP_HOME}" bash -euo pipefail -c '
+  app_home="$1"
+  app_dir="$2"
+  export PATH="${app_home}/.local/bin:${app_home}/.cargo/bin:${PATH}"
   if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
   fi
-  cd '${APP_DIR}'
+  cd "${app_dir}"
   if [[ -f uv.lock ]]; then
     uv sync --frozen --no-cache
   else
     uv sync --no-cache
   fi
-"
+' _ "${APP_HOME}" "${APP_DIR}"
 chmod +x "${APP_DIR}/scripts/button_trigger.sh"
 
 # 6. シャットダウン権限 (sudoers) 設定
 log "6/7 シャットダウン用 sudoers ルールを設定しています..."
 SUDOERS_TMP="$(mktemp)"
 cat <<EOF > "${SUDOERS_TMP}"
-${APP_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl poweroff
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
 EOF
 visudo -cf "${SUDOERS_TMP}"
 install -m 440 -o root -g root "${SUDOERS_TMP}" /etc/sudoers.d/scanner-poweroff
@@ -245,7 +255,7 @@ if [[ "${WITH_SCANBD}" -eq 1 ]]; then
 Description=scanbd/scanbm incoming socket
 
 [Socket]
-ListenStream=6566
+ListenStream=127.0.0.1:6566
 Accept=yes
 MaxConnections=1
 

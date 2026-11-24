@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -7,6 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
 DEFAULT_BUTTON_PRESET_ID = "standard_doc"
+MAX_CUSTOM_PRESETS = 50
 
 DEFAULT_SCAN_SETTINGS: dict[str, Any] = {
     "resolution": 300,
@@ -158,9 +161,28 @@ def _read_store(path: Path = SETTINGS_PATH) -> dict[str, Any]:
 
 
 def _write_store(data: dict[str, Any], path: Path = SETTINGS_PATH) -> None:
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def get_settings_payload(path: Path = SETTINGS_PATH) -> dict[str, Any]:
@@ -225,6 +247,9 @@ def save_custom_preset(
                 existing["settings"] = merged
                 _write_store(store, path)
                 return existing
+
+    if len(store["custom_presets"]) >= MAX_CUSTOM_PRESETS:
+        raise ValueError(f"カスタムプリセットは最大 {MAX_CUSTOM_PRESETS} 件まで保存できます。")
 
     new_preset = {
         "id": target_id or f"custom_{uuid.uuid4().hex[:8]}",

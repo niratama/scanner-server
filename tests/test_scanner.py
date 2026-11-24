@@ -1,9 +1,12 @@
+import os
+import stat
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -125,6 +128,23 @@ class TestSettingsStore(unittest.TestCase):
             payload = settings_store.get_settings_payload(path)
             self.assertEqual(payload["button_preset_id"], "standard_doc")
 
+    def test_custom_preset_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            for i in range(settings_store.MAX_CUSTOM_PRESETS):
+                settings_store.save_custom_preset(
+                    name=f"preset_{i}",
+                    settings={"resolution": 300},
+                    path=path,
+                )
+            with self.assertRaises(ValueError):
+                settings_store.save_custom_preset(
+                    name="overflow",
+                    settings={"resolution": 300},
+                    path=path,
+                )
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+
 
 class TestHistoryStore(unittest.TestCase):
     def test_append_load_and_clear(self):
@@ -155,6 +175,26 @@ class TestDriveClient(unittest.TestCase):
     def test_normalize_subfolder_name(self):
         self.assertEqual(drive_client.normalize_subfolder_name(" /領収書/2026/ "), "領収書/2026")
         self.assertEqual(drive_client.normalize_subfolder_name("  "), "")
+
+    def test_normalize_subfolder_name_validation(self):
+        with self.assertRaises(ValueError):
+            drive_client.normalize_subfolder_name("a/b/c/d/e/f")
+        with self.assertRaises(ValueError):
+            drive_client.normalize_subfolder_name("../secret")
+        with self.assertRaises(ValueError):
+            drive_client.normalize_subfolder_name("valid/./sub")
+        with self.assertRaises(ValueError):
+            drive_client.normalize_subfolder_name("bad\x00name")
+        with self.assertRaises(ValueError):
+            drive_client.normalize_subfolder_name("a" * (drive_client.MAX_SUBFOLDER_SEGMENT_LENGTH + 1))
+
+    def test_atomic_write_secret_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "token.json"
+            drive_client._atomic_write_secret(token_path, '{"token": "dummy"}')
+            self.assertEqual(token_path.read_text(encoding="utf-8"), '{"token": "dummy"}')
+            self.assertEqual(stat.S_IMODE(os.stat(token_path).st_mode), 0o600)
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
 
     def test_ensure_subfolder_nested(self):
         svc = MagicMock()
@@ -210,6 +250,67 @@ class TestScanPipeline(unittest.TestCase):
         self.assertEqual(scan_pipeline.sanitize_filename("photo.jpg", "png"), "photo.png")
         self.assertEqual(scan_pipeline.sanitize_filename("doc.PDF", "jpeg"), "doc.jpg")
         self.assertTrue(scan_pipeline.sanitize_filename("   ", "png").endswith(".png"))
+
+    def test_sanitize_base_name_security(self):
+        self.assertTrue(scan_pipeline.sanitize_base_name("..").startswith("scan_"))
+        self.assertTrue(scan_pipeline.sanitize_base_name(".").startswith("scan_"))
+        self.assertEqual(scan_pipeline.sanitize_base_name("a\x00b\r\nc"), "abc")
+        long_name = scan_pipeline.sanitize_base_name("x" * 200)
+        self.assertEqual(len(long_name), scan_pipeline.MAX_BASE_NAME_LENGTH)
+
+    def test_run_scan_job_timeout_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_root = Path(tmp)
+            with (
+                patch.object(scan_pipeline, "JOBS_ROOT", jobs_root),
+                patch.object(
+                    scan_pipeline.subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["scanimage"], timeout=600),
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    scan_pipeline.run_scan_job(skip_blank=False)
+                self.assertIn("タイムアウト", str(ctx.exception))
+            self.assertEqual(list(jobs_root.iterdir()), [])
+
+    def test_run_scan_job_streams_pdf_and_isolates_job_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_root = Path(tmp)
+            observed_modes: list[int] = []
+
+            def fake_scan(cmd, **kwargs):
+                batch_arg = next(a for a in cmd if a.startswith("--batch="))
+                batch_path = Path(batch_arg.split("=", 1)[1])
+                observed_modes.append(stat.S_IMODE(os.stat(batch_path.parent).st_mode))
+                (batch_path.parent / "page_0001.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            def fake_img2pdf(paths, outputstream=None):
+                self.assertIsNotNone(outputstream)
+                outputstream.write(b"%PDF-1.4\n")
+
+            with (
+                patch.object(scan_pipeline, "JOBS_ROOT", jobs_root),
+                patch.object(scan_pipeline.subprocess, "run", side_effect=fake_scan),
+                patch.object(scan_pipeline.img2pdf, "convert", side_effect=fake_img2pdf),
+                patch.object(
+                    scan_pipeline,
+                    "upload_pdf",
+                    return_value={
+                        "name": "test.pdf",
+                        "webViewLink": "https://drive.google.com/file/d/123/view",
+                        "folder": "DR-C125_Scans",
+                    },
+                ),
+            ):
+                result = scan_pipeline.run_scan_job(
+                    skip_blank=False,
+                    filename="test",
+                )
+            self.assertEqual(observed_modes, [0o700])
+            self.assertEqual(result["name"], "test.pdf")
+            self.assertEqual(list(jobs_root.iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,12 +23,28 @@ def _read_history(path: Path = HISTORY_PATH) -> list[dict[str, Any]]:
 
 
 def _write_history(items: list[dict[str, Any]], path: Path = HISTORY_PATH) -> None:
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(
-        json.dumps(items[:MAX_HISTORY_ITEMS], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(path)
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(json.dumps(items[:MAX_HISTORY_ITEMS], ensure_ascii=False, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def load_history(limit: int = 30, path: Path = HISTORY_PATH) -> list[dict[str, Any]]:

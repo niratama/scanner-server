@@ -2,7 +2,7 @@ import datetime
 import re
 import shutil
 import subprocess
-import uuid
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -12,6 +12,8 @@ from PIL import Image, ImageEnhance
 from drive_client import ensure_subfolder, get_drive_service, upload_file, upload_pdf
 
 JOBS_ROOT = Path("/tmp/dr_c125_jobs")
+SCANIMAGE_TIMEOUT_SECONDS = 600
+MAX_BASE_NAME_LENGTH = 100
 
 BLANK_SENSITIVITY_MAP: dict[str, tuple[int, float]] = {
     "low": (200, 0.0010),
@@ -50,9 +52,13 @@ def is_blank_page(
 
 
 def sanitize_base_name(name: str) -> str:
-    """ファイル名に使えない文字や既知の拡張子を除去し、ベース名を返す。"""
-    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name.strip())
-    cleaned = re.sub(r"\.(pdf|jpe?g|png)$", "", cleaned, flags=re.IGNORECASE).strip()
+    """ファイル名に使えない文字・制御文字や既知の拡張子を除去し、安全なベース名を返す。"""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", "", name)
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", cleaned.strip())
+    cleaned = re.sub(r"\.(pdf|jpe?g|png)$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" .")
+    if len(cleaned) > MAX_BASE_NAME_LENGTH:
+        cleaned = cleaned[:MAX_BASE_NAME_LENGTH].strip(" .")
     if not cleaned:
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         cleaned = f"scan_{now}"
@@ -210,8 +216,8 @@ def run_scan_job(
     if output_format not in OUTPUT_FORMAT_META:
         raise ValueError(f"未対応の出力形式です: {output_format}")
 
-    job_dir = JOBS_ROOT / f"job_{uuid.uuid4().hex[:8]}"
-    job_dir.mkdir(parents=True, exist_ok=True)
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=JOBS_ROOT))
 
     try:
         cap_fmt = _capture_format(mode, output_format)
@@ -235,7 +241,17 @@ def run_scan_job(
         report(
             f"スキャン中 ({resolution}dpi / {mode_label} / {'両面' if duplex else '片面'} / {output_format.upper()})..."
         )
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=SCANIMAGE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                "スキャンがタイムアウトしました。原稿詰まりや USB 接続を確認してください。"
+            ) from e
 
         scanned_files = sorted(job_dir.glob(f"page_*.{ext}"))
         if not scanned_files:
@@ -291,7 +307,7 @@ def run_scan_job(
             pdf_name = f"{base_name}.pdf"
             pdf_path = job_dir / pdf_name
             with pdf_path.open("wb") as f:
-                f.write(img2pdf.convert([str(p) for p in final_files]))
+                img2pdf.convert([str(p) for p in final_files], outputstream=f)
 
             total_size_mb = round(pdf_path.stat().st_size / (1024 * 1024), 2)
             report(f"Google Drive へアップロード中 ({total_size_mb} MB)...")

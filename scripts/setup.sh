@@ -226,10 +226,21 @@ systemctl enable --now dr-c125-scanner.service
 systemctl restart dr-c125-scanner.service
 
 if [[ "${WITH_SCANBD}" -eq 1 ]]; then
-  SCANBM_BIN="$(command -v scanbm || echo /usr/sbin/scanbm)"
-  if [[ ! -f /lib/systemd/system/scanbm.socket && ! -f /usr/lib/systemd/system/scanbm.socket ]]; then
-    log "    scanbm.socket / scanbm@.service を作成しています..."
-    cat <<'EOF' > /etc/systemd/system/scanbm.socket
+  if [[ -f /etc/inetd.conf ]] && grep -Eq '^[[:space:]]*sane-port[[:space:]]' /etc/inetd.conf; then
+    log "    /etc/inetd.conf の sane-port (scanbm) 設定を使用します..."
+    systemctl disable --now scanbm.socket >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/scanbm.socket /etc/systemd/system/scanbm@.service
+    systemctl daemon-reload
+    for inetd_svc in openbsd-inetd.service inetutils-inetd.service xinetd.service; do
+      if systemctl list-unit-files "${inetd_svc}" 2>/dev/null | grep -q "${inetd_svc}"; then
+        systemctl enable --now "${inetd_svc}" >/dev/null 2>&1 || true
+      fi
+    done
+  else
+    SCANBM_BIN="$(command -v scanbm || echo /usr/sbin/scanbm)"
+    if [[ ! -f /lib/systemd/system/scanbm.socket && ! -f /usr/lib/systemd/system/scanbm.socket ]]; then
+      log "    scanbm.socket / scanbm@.service を作成しています..."
+      cat <<'EOF' > /etc/systemd/system/scanbm.socket
 [Unit]
 Description=scanbd/scanbm incoming socket
 
@@ -241,7 +252,7 @@ MaxConnections=1
 [Install]
 WantedBy=sockets.target
 EOF
-    cat <<EOF > /etc/systemd/system/scanbm@.service
+      cat <<EOF > /etc/systemd/system/scanbm@.service
 [Unit]
 Description=Scanner Service (scanbm)
 Requires=scanbm.socket
@@ -255,12 +266,14 @@ StandardOutput=socket
 StandardError=journal
 Environment=SANE_CONFIG_DIR=/etc/scanbd
 EOF
-    systemctl daemon-reload
+      systemctl daemon-reload
+    fi
+
+    # saned.socket が 6566/tcp を掴んでいると scanbm.socket と競合するため無効化
+    systemctl disable --now saned.socket >/dev/null 2>&1 || true
+    systemctl enable --now scanbm.socket
   fi
 
-  # saned.socket が 6566/tcp を掴んでいると scanbm.socket と競合するため無効化
-  systemctl disable --now saned.socket >/dev/null 2>&1 || true
-  systemctl enable --now scanbm.socket
   systemctl enable --now scanbd.service
   systemctl restart scanbd.service
 fi

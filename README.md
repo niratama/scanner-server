@@ -97,6 +97,27 @@ sudo ./scripts/setup.sh --with-scanbd
 
 セットアップ完了後、初回のみ Google Drive 認証を行います（下記「5. Google Drive API 初回認証」）。
 
+### アップデート手順（`git pull` 後の反映）
+
+リポジトリを更新した際は、サービス再起動に加えて `scanbd` 用の配置済みスクリプトも必要に応じて更新してください。
+
+```bash
+cd ~/scanner-app
+git pull
+uv sync --frozen --no-cache
+sudo systemctl restart dr-c125-scanner.service
+```
+
+- **`scripts/button_trigger.sh` や OS/systemd 設定が更新された場合**:
+  `scanbd` はリポジトリ内ではなく `/etc/scanbd/scripts/button_trigger.sh` を実行するため、`git pull` だけでは反映されません（古いままの場合、CSRF 保護により `HTTP 403` になります）。以下のいずれかを実行してください。
+  ```bash
+  # まとめて同期する場合（推奨・ポート変更時は --port <PORT> を追加）
+  sudo ./scripts/setup.sh --with-scanbd
+
+  # button_trigger.sh のみ更新する場合（既定ポート 8000）
+  sudo install -m 755 ~/scanner-app/scripts/button_trigger.sh /etc/scanbd/scripts/button_trigger.sh
+  ```
+
 ---
 
 ### 手動セットアップ（参考）
@@ -112,9 +133,12 @@ sudo usermod -aG scanner,plugdev <your-user>
 #### 2. eMMC 保護・OS 最適化（`tmpfs` / `journald`）
 
 ```bash
+APP_UID=$(id -u <your-user>)
+SCANNER_GID=$(getent group scanner | cut -d: -f3)
 sudo mkdir -p /tmp/dr_c125_jobs
-sudo chmod 1777 /tmp/dr_c125_jobs
-echo "tmpfs /tmp/dr_c125_jobs tmpfs defaults,noatime,size=1500M,mode=1777 0 0" | sudo tee -a /etc/fstab
+sudo chown "${APP_UID}:${SCANNER_GID}" /tmp/dr_c125_jobs
+sudo chmod 0700 /tmp/dr_c125_jobs
+echo "tmpfs /tmp/dr_c125_jobs tmpfs defaults,noatime,size=1500M,uid=${APP_UID},gid=${SCANNER_GID},mode=0700 0 0" | sudo tee -a /etc/fstab
 sudo mount /tmp/dr_c125_jobs
 
 sudo mkdir -p /etc/systemd/journald.conf.d
@@ -158,7 +182,7 @@ uv run python drive_client.py   # 疎通確認（DR-C125_Scans フォルダの�
 `<your-user>` は実行ユーザー名に置き換えてください。
 
 ```bash
-echo "<your-user> ALL=(ALL) NOPASSWD: /usr/bin/systemctl poweroff" | sudo tee /etc/sudoers.d/scanner-poweroff
+echo "<your-user> ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff" | sudo tee /etc/sudoers.d/scanner-poweroff
 sudo chmod 440 /etc/sudoers.d/scanner-poweroff
 sudo visudo -c
 ```
@@ -231,6 +255,8 @@ sudo ufw allow 8000/tcp
 ---
 
 ## API エンドポイント
+
+> **CSRF 保護について**: 状態変更を伴うエンドポイント（`POST` / `PUT` / `DELETE`）は `X-Requested-With` ヘッダを必須としています。`curl` 等から手動で呼び出す場合は `-H "X-Requested-With: cli"` を付与してください（未付与の場合は `HTTP 403`）。
 
 | メソッド | パス | 概要 |
 |---|---|---|

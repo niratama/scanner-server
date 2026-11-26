@@ -1,13 +1,15 @@
 import asyncio
 import logging
 import subprocess
+from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+from auth_store import SESSION_COOKIE_NAME, auth_manager, is_auth_enabled
 from drive_client import (
     ROOT_FOLDER_NAME,
     create_subfolder,
@@ -15,6 +17,7 @@ from drive_client import (
     normalize_subfolder_name,
 )
 from history_store import append_history, clear_history, load_history
+from m5stick_bridge import M5StickBridge, build_state_payload
 from scan_pipeline import run_scan_job
 from settings_store import (
     delete_custom_preset,
@@ -27,13 +30,181 @@ from settings_store import (
 
 logger = logging.getLogger("scanner_server")
 
-app = FastAPI(title="DR-C125 Scanner")
-
 STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+LOCALHOST_CLIENTS = {"127.0.0.1", "::1", "localhost"}
+
+scan_lock = asyncio.Lock()
+state = {
+    "running": False,
+    "powering_off": False,
+    "message": "待機中",
+    "last_error": None,
+}
+_app_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _current_m5_status() -> str:
+    if state["powering_off"]:
+        return "powering_off"
+    if state["running"]:
+        return "scanning"
+    return "idle"
+
+
+def _build_m5_state() -> dict:
+    qr_token, _ = auth_manager.get_qr_token()
+    return build_state_payload(
+        status=_current_m5_status(),
+        qr_token=qr_token if is_auth_enabled() else "",
+        settings_payload=get_settings_payload(),
+    )
+
+
+def _schedule_poweroff() -> tuple[bool, str]:
+    if scan_lock.locked() or state["running"]:
+        return False, "スキャン実行中のためシャットダウンできません"
+    if state["powering_off"]:
+        return False, "すでにシャットダウン処理中です"
+
+    state["powering_off"] = True
+    state["message"] = "シャットダウン処理中..."
+    m5_bridge.send_shutdown(reason="poweroff")
+
+    async def _do_poweroff():
+        await asyncio.sleep(1.5)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["sudo", "-n", "/usr/bin/systemctl", "poweroff"],
+            check=False,
+        )
+
+    loop = _app_loop
+    try:
+        running_loop = asyncio.get_running_loop()
+        running_loop.create_task(_do_poweroff())
+    except RuntimeError:
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(_do_poweroff()))
+        else:
+            subprocess.Popen(["sudo", "-n", "/usr/bin/systemctl", "poweroff"])
+    return True, "シャットダウンを開始しました"
+
+
+def _on_m5_refresh_qr() -> None:
+    auth_manager.get_qr_token(force_rotate=True)
+
+
+def _on_m5_select_preset(preset_id: str) -> tuple[bool, str]:
+    try:
+        preset = set_button_preset_id(preset_id)
+        return True, preset["name"]
+    except ValueError as e:
+        return False, str(e)
+
+
+m5_bridge = M5StickBridge(
+    get_state_fn=_build_m5_state,
+    on_refresh_qr=_on_m5_refresh_qr,
+    on_select_preset=_on_m5_select_preset,
+    on_poweroff=_schedule_poweroff,
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _app_loop
+    _app_loop = asyncio.get_running_loop()
+    auth_manager.get_qr_token()
+    m5_bridge.start()
+    try:
+        yield
+    finally:
+        reason = "poweroff" if state["powering_off"] else "restart"
+        m5_bridge.stop(shutdown_reason=reason)
+        _app_loop = None
+
+
+app = FastAPI(title="DR-C125 Scanner", lifespan=lifespan)
+
+
+def _is_local_request(request: Request) -> bool:
+    client = request.client
+    return bool(client and client.host in LOCALHOST_CLIENTS)
+
+
+def _render_auth_page(title: str, lead: str, sub: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} - DR-C125 スキャナー</title>
+<style>
+  body {{
+    font-family: system-ui, -apple-system, sans-serif;
+    max-width: 440px;
+    margin: 0 auto;
+    padding: 32px 16px;
+    background: #f4f6f8;
+    color: #202124;
+  }}
+  .card {{
+    background: #ffffff;
+    border-radius: 14px;
+    padding: 24px 20px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    text-align: center;
+  }}
+  .icon {{
+    font-size: 2.4rem;
+    margin-bottom: 8px;
+  }}
+  h1 {{
+    font-size: 1.2rem;
+    margin: 0 0 10px;
+  }}
+  p {{
+    font-size: 0.92rem;
+    color: #5f6368;
+    line-height: 1.6;
+    margin: 0 0 10px;
+  }}
+  .sub {{
+    font-size: 0.82rem;
+    color: #80868b;
+    margin-top: 12px;
+  }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon" aria-hidden="true">&#128274;</div>
+    <h1>{title}</h1>
+    <p>{lead}</p>
+    <p class="sub">{sub}</p>
+  </div>
+</body>
+</html>
+"""
+
+
+AUTH_REQUIRED_HTML = _render_auth_page(
+    "QR 認証が必要です",
+    "スキャナー横の M5StickC に表示されている QR コードをスマホのカメラで読み取ってください。",
+    "認証すると、このブラウザでは 30 日間ログイン状態が維持されます。",
+)
+
+AUTH_EXPIRED_HTML = _render_auth_page(
+    "QR コードの有効期限が切れています",
+    "この QR コードはすでに使用されたか、有効期限が切れています。M5StickC に表示されている最新の QR コードをもう一度読み取ってください。",
+    "M5StickC の前面ボタン（BtnA）を押すと新しい QR コードを手動発行できます。",
+)
 
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
+    path = request.url.path
+
     if request.method in STATE_CHANGING_METHODS:
         if not request.headers.get("x-requested-with"):
             return JSONResponse(
@@ -49,6 +220,28 @@ async def security_middleware(request: Request, call_next):
                     content={"detail": "クロスオリジンリクエストは許可されていません"},
                 )
 
+    if is_auth_enabled():
+        is_qr_login = request.method == "GET" and path.startswith("/a/")
+        is_local_button = (
+            request.method == "POST"
+            and path == "/api/trigger/button"
+            and _is_local_request(request)
+        )
+        if not is_qr_login and not is_local_button:
+            session_token = request.cookies.get(SESSION_COOKIE_NAME)
+            if auth_manager.verify_session(session_token) is None:
+                if path.startswith("/api/"):
+                    response = JSONResponse(
+                        status_code=401,
+                        content={"detail": "認証が必要です。M5StickC の QR コードを読み取ってください。"},
+                    )
+                else:
+                    response = HTMLResponse(content=AUTH_REQUIRED_HTML, status_code=401)
+                response.headers.setdefault("X-Frame-Options", "DENY")
+                response.headers.setdefault("X-Content-Type-Options", "nosniff")
+                response.headers.setdefault("Referrer-Policy", "no-referrer")
+                return response
+
     response = await call_next(request)
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -59,15 +252,6 @@ async def security_middleware(request: Request, call_next):
             "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'",
         )
     return response
-
-
-scan_lock = asyncio.Lock()
-state = {
-    "running": False,
-    "powering_off": False,
-    "message": "待機中",
-    "last_error": None,
-}
 
 
 class ScanSettings(BaseModel):
@@ -162,6 +346,7 @@ async def _execute_scan(
     finally:
         state["running"] = False
         scan_lock.release()
+        m5_bridge.notify_state_changed()
 
 
 @app.post("/api/scan")
@@ -185,10 +370,12 @@ async def start_scan(req: ScanRequest):
         state["running"] = True
         state["message"] = "スキャン開始..."
         state["last_error"] = None
+        m5_bridge.notify_state_changed()
         asyncio.create_task(_execute_scan(req, trigger="web", preset_name=req.preset_name))
     except Exception:
         state["running"] = False
         scan_lock.release()
+        m5_bridge.notify_state_changed()
         raise
     return {"status": "started"}
 
@@ -209,6 +396,7 @@ async def trigger_button_scan(wait: bool = Query(default=False)):
         state["running"] = True
         state["message"] = f"本体ボタン起動 ({preset['name']})..."
         state["last_error"] = None
+        m5_bridge.notify_state_changed()
 
         if wait:
             result = await _execute_scan(req, trigger="button", preset_name=preset["name"])
@@ -231,6 +419,7 @@ async def trigger_button_scan(wait: bool = Query(default=False)):
         state["running"] = False
         if scan_lock.locked():
             scan_lock.release()
+        m5_bridge.notify_state_changed()
         raise
     return {
         "status": "started",
@@ -241,11 +430,14 @@ async def trigger_button_scan(wait: bool = Query(default=False)):
 
 @app.get("/api/status")
 async def get_status():
+    settings = get_settings_payload()
     return {
         "running": state["running"],
         "powering_off": state["powering_off"],
         "message": state["message"],
         "last_error": state["last_error"],
+        "button_preset_id": settings["button_preset_id"],
+        "m5stick_connected": m5_bridge.connected_port is not None,
         "history": load_history(limit=20),
     }
 
@@ -272,6 +464,7 @@ async def update_button_preset(req: ButtonPresetRequest):
         preset = set_button_preset_id(req.preset_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    m5_bridge.notify_state_changed()
     return {"button_preset_id": preset["id"], "preset": preset}
 
 
@@ -285,6 +478,7 @@ async def create_preset(req: PresetCreateRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    m5_bridge.notify_state_changed()
     return {"preset": preset}
 
 
@@ -293,6 +487,7 @@ async def remove_preset(preset_id: str):
     deleted = delete_custom_preset(preset_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="指定されたプリセットが見つかりません")
+    m5_bridge.notify_state_changed()
     return {"status": "deleted", "id": preset_id}
 
 
@@ -331,25 +526,94 @@ async def add_folder(req: FolderCreateRequest):
         )
 
 
+@app.get("/a/{token}")
+async def qr_login(token: str):
+    """M5StickC に表示されたワンタイム QR トークンで 30 日セッション Cookie を発行する。"""
+    if not is_auth_enabled():
+        return RedirectResponse(url="/", status_code=303)
+    session = auth_manager.consume_qr_token(token)
+    if session is None:
+        return HTMLResponse(content=AUTH_EXPIRED_HTML, status_code=401)
+    m5_bridge.notify_state_changed()
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session["token"],
+        max_age=session["max_age"],
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.get("/api/auth/session")
+async def get_auth_session(request: Request):
+    enabled = is_auth_enabled()
+    if not enabled:
+        return {
+            "auth_enabled": False,
+            "authenticated": True,
+            "expires_at": None,
+            "remaining_seconds": None,
+            "active_sessions": 0,
+            "m5stick_connected": m5_bridge.connected_port is not None,
+        }
+    info = auth_manager.verify_session(request.cookies.get(SESSION_COOKIE_NAME))
+    if info is None:
+        raise HTTPException(status_code=401, detail="セッションが無効です")
+    return {
+        "auth_enabled": True,
+        "authenticated": True,
+        "expires_at": info["expires_at"],
+        "remaining_seconds": info["remaining_seconds"],
+        "active_sessions": info["active_sessions"],
+        "m5stick_connected": m5_bridge.connected_port is not None,
+    }
+
+
+@app.post("/api/auth/refresh")
+async def refresh_auth_session(request: Request):
+    """スマホ UI から現在のセッションを 30 日間延長（トークンもローテーション）する。"""
+    if not is_auth_enabled():
+        return {"auth_enabled": False, "refreshed": False}
+    refreshed = auth_manager.refresh_session(request.cookies.get(SESSION_COOKIE_NAME))
+    if refreshed is None:
+        raise HTTPException(status_code=401, detail="セッションが無効です")
+    resp = JSONResponse(
+        content={
+            "auth_enabled": True,
+            "refreshed": True,
+            "expires_at": refreshed["expires_at"],
+            "remaining_seconds": refreshed["remaining_seconds"],
+            "active_sessions": refreshed["active_sessions"],
+        }
+    )
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=refreshed["token"],
+        max_age=refreshed["max_age"],
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def logout_auth_session(request: Request):
+    if is_auth_enabled():
+        auth_manager.revoke_session(request.cookies.get(SESSION_COOKIE_NAME))
+    resp = JSONResponse(content={"status": "logged_out"})
+    resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+    return resp
+
+
 @app.post("/api/poweroff")
 async def poweroff():
-    if scan_lock.locked():
-        raise HTTPException(status_code=409, detail="スキャン実行中のためシャットダウンできません")
-    if state["powering_off"]:
-        raise HTTPException(status_code=409, detail="すでにシャットダウン処理中です")
-
-    state["powering_off"] = True
-    state["message"] = "シャットダウン処理中..."
-
-    async def _do_poweroff():
-        await asyncio.sleep(1.5)
-        await asyncio.to_thread(
-            subprocess.run,
-            ["sudo", "-n", "/usr/bin/systemctl", "poweroff"],
-            check=False,
-        )
-
-    asyncio.create_task(_do_poweroff())
+    ok, detail = _schedule_poweroff()
+    if not ok:
+        raise HTTPException(status_code=409, detail=detail)
     return {"status": "powering_off"}
 
 
@@ -1050,6 +1314,18 @@ HTML_UI = """<!DOCTYPE html>
     <button type="button" id="powerBtn" class="danger-outline">DG-CANPC を安全にシャットダウン</button>
   </div>
 
+  <div class="card" id="sessionCard" style="display:none;">
+    <div class="card-header">
+      <h2>認証セッション</h2>
+      <span id="sessionRemainingBadge" class="badge">確認中...</span>
+    </div>
+    <div class="hint" id="sessionInfoText" style="margin:0 0 10px;">セッション情報を読み込み中...</div>
+    <div class="inline-row">
+      <button type="button" id="refreshSessionBtn" class="secondary" style="flex:1;">セッションを 30 日延長</button>
+      <button type="button" id="logoutBtn" class="small-danger" style="padding:10px 12px;font-size:0.85rem;">ログアウト</button>
+    </div>
+  </div>
+
   <dialog id="poweroffDialog" aria-labelledby="poweroffTitle">
     <h1 id="poweroffTitle">シャットダウンの確認</h1>
     <p>DG-CANPC の電源を切りますか？スキャン完了後に実行してください。</p>
@@ -1092,10 +1368,14 @@ let customPresets = [];
 let activePresetId = null;
 let buttonPresetId = 'standard_doc';
 
-function apiFetch(url, options = {}) {
+async function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set('X-Requested-With', 'scanner-ui');
-  return fetch(url, { ...options, headers });
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401) {
+    window.location.reload();
+  }
+  return res;
 }
 
 function safeExternalUrl(raw) {
@@ -1437,16 +1717,84 @@ function renderHistory(items) {
 async function fetchStatus() {
   try {
     const res = await apiFetch('/api/status');
+    if (!res.ok) return;
     const data = await res.json();
     const busy = Boolean(data.running || data.powering_off);
     document.getElementById('statusBox').textContent = data.message;
     document.getElementById('scanBtn').disabled = busy;
     document.getElementById('powerBtn').disabled = busy;
     document.getElementById('testButtonTriggerBtn').disabled = busy;
+    if (data.button_preset_id && data.button_preset_id !== buttonPresetId) {
+      buttonPresetId = data.button_preset_id;
+      const sel = document.getElementById('buttonPresetSelect');
+      if (sel) sel.value = buttonPresetId;
+    }
     showError(data.last_error);
     renderHistory(data.history);
   } catch (e) {
     document.getElementById('statusBox').textContent = 'サーバーに接続できません（電源OFFまたは再起動中）';
+  }
+}
+
+function renderSessionInfo(data) {
+  const card = document.getElementById('sessionCard');
+  if (!data || !data.auth_enabled) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  const badge = document.getElementById('sessionRemainingBadge');
+  const info = document.getElementById('sessionInfoText');
+  const remSec = Number(data.remaining_seconds || 0);
+  const remDays = Math.max(0, Math.ceil(remSec / 86400));
+  badge.textContent = `残り約 ${remDays} 日`;
+  if (data.expires_at) {
+    const exp = new Date(data.expires_at * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    const expStr = `${exp.getFullYear()}/${pad(exp.getMonth() + 1)}/${pad(exp.getDate())} ${pad(exp.getHours())}:${pad(exp.getMinutes())}`;
+    info.textContent = `有効期限: ${expStr} まで（有効端末: ${data.active_sessions || 1}）`;
+  } else {
+    info.textContent = 'ログイン中';
+  }
+}
+
+async function loadSessionInfo() {
+  try {
+    const res = await apiFetch('/api/auth/session');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderSessionInfo(data);
+  } catch (e) {
+    // ignore transient network errors
+  }
+}
+
+async function refreshSession() {
+  const btn = document.getElementById('refreshSessionBtn');
+  const info = document.getElementById('sessionInfoText');
+  btn.disabled = true;
+  try {
+    const res = await apiFetch('/api/auth/refresh', { method: 'POST' });
+    if (!res.ok) {
+      showError('セッションの更新に失敗しました');
+      return;
+    }
+    const data = await res.json();
+    renderSessionInfo(data);
+    info.textContent = `${info.textContent} — 更新しました`;
+    showError(null);
+  } catch (e) {
+    showError('セッション更新中に通信エラーが発生しました');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function logoutSession() {
+  try {
+    await apiFetch('/api/auth/logout', { method: 'POST' });
+  } finally {
+    window.location.reload();
   }
 }
 
@@ -1592,6 +1940,8 @@ document.getElementById('savePresetBtn').addEventListener('click', saveCustomPre
 document.getElementById('refreshFoldersBtn').addEventListener('click', loadFolders);
 document.getElementById('buttonPresetSelect').addEventListener('change', e => updateButtonPreset(e.target.value));
 document.getElementById('testButtonTriggerBtn').addEventListener('click', testButtonTrigger);
+document.getElementById('refreshSessionBtn').addEventListener('click', refreshSession);
+document.getElementById('logoutBtn').addEventListener('click', logoutSession);
 document.getElementById('resetImageBtn').addEventListener('click', () => {
   document.getElementById('rotation').value = '0';
   document.getElementById('jpeg_quality').value = '0';
@@ -1668,6 +2018,7 @@ if (!('closedBy' in HTMLDialogElement.prototype)) {
 
 (async function init() {
   await loadSettings();
+  loadSessionInfo();
   loadFolders();
   fetchStatus();
   setInterval(fetchStatus, 2000);

@@ -27,6 +27,11 @@
   - `drive.file` スコープのまま、`DR-C125_Scans` 配下のサブフォルダ一覧取得・選択・新規作成（`2026/領収書` のような階層指定にも対応）が可能。
 - **安全なリモートシャットダウン**
   - スキャン実行中は多重実行・シャットダウンをロックで防止し、完了後に確認ダイアログ経由で `systemctl poweroff` を実行可能。
+- **M5StickC 連携（QR コード認証・プロファイル切替・シャットダウン）**
+  - DG-CANPC に USB シリアル直結した初代 M5StickC（80×160）にワンタイム認証 QR コードを表示し、スマホで読み取るだけで 30 日有効な HttpOnly セッション Cookie を発行。
+  - スマホ UI からいつでもセッションの 30 日延長（更新）・ログアウトが可能。
+  - M5StickC 本体ボタンから本体スタートボタン用プロファイルの切り替えと安全シャットダウン（2 秒長押し）に対応。
+  - サーバー起動前は「起動中」画面、サーバー終了〜電源断までは「シャットダウン中」画面を表示（USB 給電断を検知して M5StickC 自身も自動電源オフ）。
 
 ---
 
@@ -54,11 +59,17 @@
 ```text
 .
 ├── app.py               # FastAPI サーバー & スマホ向け HTML UI
+├── auth_store.py        # ワンタイム QR トークン & 30 日セッション Cookie 管理
+├── m5stick_bridge.py    # M5StickC USB シリアル双方向ブリッジ（JSON Lines）
 ├── scan_pipeline.py     # scanimage 実行・白紙除去・画像調整・PDF 化・アップロード統合
 ├── drive_client.py      # Google Drive API クライアント（自動リフレッシュ・サブフォルダ管理・アップロード）
 ├── auth_drive.py        # 初回 OAuth 認証用スクリプト（token.json 生成）
 ├── settings_store.py    # 組み込み／カスタムプリセット・前回設定・本体ボタン設定の永続化
 ├── history_store.py     # サーバー側スキャン履歴（history.json）の永続化
+├── firmware/
+│   └── m5stickc/        # 初代 M5StickC 用 PlatformIO ファームウェア
+│       ├── platformio.ini
+│       └── src/main.cpp
 ├── pyproject.toml       # Python プロジェクト・依存パッケージ定義（uv 管理）
 ├── uv.lock              # 依存バージョンロックファイル
 ├── scripts/
@@ -69,6 +80,7 @@
 │   └── test_scanner.py  # ユニットテスト
 ├── credentials.json     # （要配置・非公開）Google Cloud OAuth クライアント認証情報
 ├── token.json           # （自動生成・非公開）OAuth トークン
+├── auth_sessions.json   # （自動生成・非公開）30 日セッションハッシュ（chmod 600）
 ├── settings.json        # （自動生成）カスタムプリセット・前回設定・本体ボタンプロファイル
 └── history.json         # （自動生成）スキャン履歴
 ```
@@ -228,13 +240,37 @@ sudo ufw allow 8000/tcp
 5. Web UI の「本体スタートボタン連動」から、ボタン押下時に実行したいプリセットを選択します。
    - 動作確認ログ: `journalctl -t dr-c125-button -n 20 --no-pager`
 
+#### 9. M5StickC（初代）ファームウェア書き込み & 運用
+
+1. PlatformIO（CLI または VS Code 拡張）で `firmware/m5stickc` をビルドして初代 M5StickC へ書き込みます。
+   ```bash
+   cd firmware/m5stickc
+   pio run -t upload
+   ```
+2. 書き込み済みの M5StickC を DG-CANPC の USB ポートへ接続します（`scripts/setup.sh` で `dialout` グループ権限を自動付与済み）。
+3. 操作方法:
+   - **`BtnB`（側面）**: 画面切替（`QR 認証` → `プロファイル切替` → `電源オフ`）
+   - **`BtnA`（前面）**:
+     - `QR 認証`: 短押しで QR トークンを手動更新
+     - `プロファイル切替`: 短押しで次の候補へ移動、長押し（0.7 秒）で確定（本体スタートボタン設定を更新）
+     - `電源オフ`: 2 秒長押しで DG-CANPC を安全シャットダウン
+4. 主な環境変数（任意）:
+   - `SCANNER_AUTH_ENABLED`: `1`（既定・QR 認証有効）/ `0`（緊急・開発用に認証無効化）
+   - `M5STICK_ENABLED`: `1`（既定）/ `0`（シリアルブリッジ無効化）
+   - `M5STICK_PORT`: シリアルポートを明示指定（既定は `/dev/ttyUSB*` 等を自動検出）
+   - `SCANNER_BASE_URL`: QR コードに埋め込むベース URL を明示指定（既定は LAN IP と `SCANNER_PORT` から自動生成）
+
 ---
 
 ## API エンドポイント
 
 | メソッド | パス | 概要 |
 |---|---|---|
-| `GET` | `/` | スマホ向け Web UI を返却 |
+| `GET` | `/` | スマホ向け Web UI を返却（未認証時は QR 認証案内を表示） |
+| `GET` | `/a/{token}` | M5StickC のワンタイム QR トークンを検証し 30 日セッション Cookie を発行 |
+| `GET` | `/api/auth/session` | 現在のセッション有効期限・残り時間・M5StickC 接続状態を取得 |
+| `POST` | `/api/auth/refresh` | 現在のセッションを 30 日間延長（トークンローテーション） |
+| `POST` | `/api/auth/logout` | 現在のセッションを破棄してログアウト |
 | `POST` | `/api/scan` | スキャンジョブを開始（前回設定を自動保存） |
 | `POST` | `/api/trigger/button` | 本体ボタン用に選択済みプリセットでスキャンを実行（`?wait=true` で完了待機） |
 | `GET` | `/api/status` | 実行状態・進捗メッセージ・エラー・直近 20 件の履歴を取得 |

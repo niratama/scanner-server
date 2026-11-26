@@ -96,8 +96,8 @@ apt-get update -qq
 apt-get install -y -qq "${APT_PACKAGES[@]}"
 
 # 2. ユーザーグループ付与
-log "2/7 ユーザー ${APP_USER} を scanner / plugdev グループへ追加しています..."
-for grp in scanner plugdev; do
+log "2/7 ユーザー ${APP_USER} を scanner / plugdev / dialout グループへ追加しています..."
+for grp in scanner plugdev dialout; do
   if getent group "${grp}" >/dev/null 2>&1; then
     usermod -aG "${grp}" "${APP_USER}"
   fi
@@ -222,7 +222,9 @@ Wants=network-online.target
 Type=simple
 User=${APP_USER}
 Group=scanner
+SupplementaryGroups=dialout
 WorkingDirectory=${APP_DIR}
+Environment=SCANNER_PORT=${PORT}
 ExecStart=${APP_DIR}/.venv/bin/uvicorn app:app --host 0.0.0.0 --port ${PORT}
 Restart=on-failure
 RestartSec=3

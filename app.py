@@ -129,9 +129,20 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="DR-C125 Scanner", lifespan=lifespan)
 
 
+PROXY_FORWARD_HEADERS = (
+    "x-forwarded-for",
+    "forwarded",
+    "x-real-ip",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+)
+
+
 def _is_local_request(request: Request) -> bool:
     client = request.client
-    return bool(client and client.host in LOCALHOST_CLIENTS)
+    if not (client and client.host in LOCALHOST_CLIENTS):
+        return False
+    return not any(request.headers.get(h) for h in PROXY_FORWARD_HEADERS)
 
 
 def _is_https_request(request: Request) -> bool:

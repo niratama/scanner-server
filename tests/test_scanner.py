@@ -74,8 +74,10 @@ def _install_stub_modules():
 
 _install_stub_modules()
 
+import auth_store
 import drive_client
 import history_store
+import m5stick_bridge
 import scan_pipeline
 import settings_store
 
@@ -215,6 +217,23 @@ class TestDriveClient(unittest.TestCase):
 
 
 class TestScanPipeline(unittest.TestCase):
+    def test_is_scanner_online_via_sysfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertFalse(scan_pipeline.is_scanner_online(sysfs_root=root))
+
+            other = root / "1-1"
+            other.mkdir()
+            (other / "idVendor").write_text("0403\n", encoding="ascii")
+            (other / "idProduct").write_text("6001\n", encoding="ascii")
+            self.assertFalse(scan_pipeline.is_scanner_online(sysfs_root=root))
+
+            canon = root / "1-2"
+            canon.mkdir()
+            (canon / "idVendor").write_text("1083\n", encoding="ascii")
+            (canon / "idProduct").write_text("1640\n", encoding="ascii")
+            self.assertTrue(scan_pipeline.is_scanner_online(sysfs_root=root))
+
     def test_build_scanimage_cmd_defaults(self):
         cmd = scan_pipeline.build_scanimage_cmd(batch_pattern="/tmp/page_%04d.jpg")
         self.assertEqual(cmd[0], "scanimage")
@@ -311,6 +330,168 @@ class TestScanPipeline(unittest.TestCase):
             self.assertEqual(observed_modes, [0o700])
             self.assertEqual(result["name"], "test.pdf")
             self.assertEqual(list(jobs_root.iterdir()), [])
+
+
+class TestAuthStore(unittest.TestCase):
+    def test_qr_token_onetime_and_session_persistence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_path = Path(tmp) / "auth_sessions.json"
+            clock = [1_700_000_000.0]
+            mgr = auth_store.AuthManager(sessions_path, now_fn=lambda: clock[0])
+
+            qr1, _ = mgr.get_qr_token()
+            self.assertEqual(len(qr1), 12)
+
+            # ワンタイム消費成功 -> セッション発行 & QR トークン自動更新
+            session = mgr.consume_qr_token(qr1)
+            self.assertIsNotNone(session)
+            self.assertEqual(session["max_age"], auth_store.SESSION_TTL_SECONDS)
+            self.assertEqual(stat.S_IMODE(os.stat(sessions_path).st_mode), 0o600)
+
+            # 同じ QR トークンは再利用不可
+            self.assertIsNone(mgr.consume_qr_token(qr1))
+            qr2, _ = mgr.get_qr_token()
+            self.assertNotEqual(qr1, qr2)
+
+            # 別インスタンスでも 30 日セッションを復元できる（再起動耐性）
+            mgr_reloaded = auth_store.AuthManager(sessions_path, now_fn=lambda: clock[0])
+            info = mgr_reloaded.verify_session(session["token"])
+            self.assertIsNotNone(info)
+            self.assertEqual(info["remaining_seconds"], auth_store.SESSION_TTL_SECONDS)
+
+            # 20 日経過後にスマホからセッション延長 -> トークン更新 & 残り 30 日に延長
+            clock[0] += 20 * 24 * 60 * 60
+            refreshed = mgr_reloaded.refresh_session(session["token"])
+            self.assertIsNotNone(refreshed)
+            self.assertNotEqual(refreshed["token"], session["token"])
+            self.assertIsNone(mgr_reloaded.verify_session(session["token"]))
+            self.assertEqual(refreshed["remaining_seconds"], auth_store.SESSION_TTL_SECONDS)
+
+            # さらに 25 日経過しても延長済みなので有効
+            clock[0] += 25 * 24 * 60 * 60
+            self.assertIsNotNone(mgr_reloaded.verify_session(refreshed["token"]))
+
+            # ログアウトで即時無効化
+            self.assertTrue(mgr_reloaded.revoke_session(refreshed["token"]))
+            self.assertIsNone(mgr_reloaded.verify_session(refreshed["token"]))
+
+    def test_qr_token_expiry_and_session_expiry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_path = Path(tmp) / "auth_sessions.json"
+            clock = [1_700_000_000.0]
+            mgr = auth_store.AuthManager(
+                sessions_path,
+                session_ttl_seconds=100,
+                qr_token_ttl_seconds=10,
+                now_fn=lambda: clock[0],
+            )
+            qr1, _ = mgr.get_qr_token()
+            clock[0] += 11
+            # 期限切れ QR は拒否される
+            self.assertIsNone(mgr.consume_qr_token(qr1))
+
+            qr2, _ = mgr.get_qr_token()
+            self.assertNotEqual(qr1, qr2)
+            session = mgr.consume_qr_token(qr2)
+            self.assertIsNotNone(session)
+
+            clock[0] += 101
+            self.assertIsNone(mgr.verify_session(session["token"]))
+
+    def test_corrupted_created_at_does_not_crash_session_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_path = Path(tmp) / "auth_sessions.json"
+            clock = [1_700_000_000.0]
+            raw_token = "valid-session-token"
+            token_hash = auth_store._hash_token(raw_token)
+            sessions_path.write_text(
+                (
+                    '{"sessions": ['
+                    f'{{"hash": "{token_hash}", "created_at": "invalid", "expires_at": {clock[0] + 600}}},'
+                    f'{{"hash": "{token_hash}", "created_at": 123, "expires_at": true}}'
+                    "]}"
+                ),
+                encoding="utf-8",
+            )
+            mgr = auth_store.AuthManager(sessions_path, now_fn=lambda: clock[0])
+            info = mgr.verify_session(raw_token)
+            self.assertIsNotNone(info)
+            self.assertEqual(info["created_at"], clock[0])
+            self.assertEqual(info["active_sessions"], 1)
+
+
+class TestM5StickBridge(unittest.TestCase):
+    def test_build_base_url_parses_ipv4_and_ipv6(self):
+        with patch.dict(os.environ, {"SCANNER_BASE_URL": "http://192.168.1.50:8000/"}, clear=False):
+            base_url, host = m5stick_bridge.build_base_url()
+            self.assertEqual(base_url, "http://192.168.1.50:8000")
+            self.assertEqual(host, "192.168.1.50")
+
+        with patch.dict(os.environ, {"SCANNER_BASE_URL": "https://[fd00::1234]:8443/app/"}, clear=False):
+            base_url, host = m5stick_bridge.build_base_url()
+            self.assertEqual(base_url, "https://[fd00::1234]:8443/app")
+            self.assertEqual(host, "fd00::1234")
+
+    def test_build_state_payload_and_command_handling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            payload = m5stick_bridge.build_state_payload(
+                status="idle",
+                qr_token="AbCdEf123456",
+                settings_payload=settings_store.get_settings_payload(settings_path),
+                base_url="http://192.168.1.50:8000",
+                display_ip="192.168.1.50",
+            )
+            self.assertEqual(payload["t"], "state")
+            self.assertEqual(payload["url"], "http://192.168.1.50:8000/a/AbCdEf123456")
+            self.assertEqual(payload["p_id"], "standard_doc")
+            self.assertGreaterEqual(payload["p_cnt"], 6)
+
+            sent_lines: list[bytes] = []
+
+            class FakeSerial:
+                def write(self, data: bytes) -> int:
+                    sent_lines.append(data)
+                    return len(data)
+
+                def flush(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            refreshed_calls = []
+            poweroff_calls = []
+            bridge = m5stick_bridge.M5StickBridge(
+                get_state_fn=lambda: m5stick_bridge.build_state_payload(
+                    status="idle",
+                    qr_token="Tok123456789",
+                    settings_payload=settings_store.get_settings_payload(settings_path),
+                    base_url="http://192.168.1.50:8000",
+                    display_ip="192.168.1.50",
+                ),
+                on_refresh_qr=lambda: refreshed_calls.append(True),
+                on_select_preset=lambda pid: (
+                    True,
+                    settings_store.set_button_preset_id(pid, path=settings_path)["name"],
+                ),
+                on_poweroff=lambda: (poweroff_calls.append(True) or True, "ok"),
+            )
+            bridge._ser = FakeSerial()
+
+            bridge.handle_incoming_line('{"cmd":"hello"}\n')
+            bridge.handle_incoming_line('{"cmd":"refresh_qr"}\n')
+            bridge.handle_incoming_line('{"cmd":"select_preset","id":"receipt"}\n')
+            bridge.handle_incoming_line('{"cmd":"poweroff"}\n')
+
+            self.assertEqual(len(refreshed_calls), 1)
+            self.assertEqual(len(poweroff_calls), 1)
+            self.assertEqual(
+                settings_store.get_settings_payload(settings_path)["button_preset_id"],
+                "receipt",
+            )
+            decoded = [line.decode("utf-8").strip() for line in sent_lines]
+            self.assertTrue(any('"t":"shutdown","reason":"poweroff"' in d for d in decoded))
 
 
 if __name__ == "__main__":

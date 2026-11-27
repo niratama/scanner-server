@@ -3,7 +3,11 @@ credentials.json
 token.json
 settings.json
 history.json
+auth_sessions.json
 *.json.tmp
+
+# PlatformIO build artifacts
+firmware/m5stickc/.pio/
 
 # Local handover / scratch docs
 docs/tmp/

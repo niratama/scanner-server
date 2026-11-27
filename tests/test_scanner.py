@@ -421,6 +421,17 @@ class TestAuthStore(unittest.TestCase):
 
 
 class TestM5StickBridge(unittest.TestCase):
+    def test_build_base_url_parses_ipv4_and_ipv6(self):
+        with patch.dict(os.environ, {"SCANNER_BASE_URL": "http://192.168.1.50:8000/"}, clear=False):
+            base_url, host = m5stick_bridge.build_base_url()
+            self.assertEqual(base_url, "http://192.168.1.50:8000")
+            self.assertEqual(host, "192.168.1.50")
+
+        with patch.dict(os.environ, {"SCANNER_BASE_URL": "https://[fd00::1234]:8443/app/"}, clear=False):
+            base_url, host = m5stick_bridge.build_base_url()
+            self.assertEqual(base_url, "https://[fd00::1234]:8443/app")
+            self.assertEqual(host, "fd00::1234")
+
     def test_build_state_payload_and_command_handling(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings_path = Path(tmp) / "settings.json"

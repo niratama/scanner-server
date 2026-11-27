@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 try:
     import serial
@@ -46,7 +47,8 @@ def build_base_url() -> tuple[str, str]:
     """(base_url, display_ip) を返す。"""
     explicit = os.environ.get("SCANNER_BASE_URL", "").strip().rstrip("/")
     if explicit:
-        host_part = explicit.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        parsed = urlsplit(explicit if "://" in explicit else f"http://{explicit}")
+        host_part = parsed.hostname or explicit
         return explicit, host_part
     ip = detect_lan_ip()
     port = os.environ.get("SCANNER_PORT", "8000").strip() or "8000"

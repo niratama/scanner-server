@@ -14,7 +14,7 @@ constexpr uint32_t POWEROFF_HOLD_MS = 2000;
 constexpr uint32_t NOTICE_DURATION_MS = 1800;
 constexpr uint32_t VBUS_LOST_POWEROFF_MS = 2000;
 constexpr uint8_t BRIGHTNESS_ACTIVE = 110;
-constexpr uint8_t BRIGHTNESS_DIM = 24;
+constexpr uint8_t BRIGHTNESS_DIM = 0;
 
 enum class DevicePhase {
     Booting,
@@ -58,6 +58,7 @@ bool isDimmed = false;
 bool needsRedraw = true;
 
 bool btnAHoldTriggered = false;
+bool swallowBtnAUntilRelease = false;
 uint32_t btnAPressStartMs = 0;
 int lastPowerBarPx = -1;
 
@@ -117,6 +118,39 @@ void drawCenteredText(const String& text, int y, uint16_t color, uint16_t bg) {
     M5.Display.setTextDatum(top_left);
 }
 
+// 現在のフォントで maxWidthPx に収まるよう UTF-8 文字境界で安全に切り詰める
+String fitTextToWidth(const String& text, int maxWidthPx) {
+    if (M5.Display.textWidth(text) <= maxWidthPx) {
+        return text;
+    }
+    const String ellipsis = "..";
+    const int ellipsisW = M5.Display.textWidth(ellipsis);
+    String out = "";
+    const size_t len = text.length();
+    size_t i = 0;
+    while (i < len) {
+        const uint8_t c = static_cast<uint8_t>(text[i]);
+        size_t charLen = 1;
+        if ((c & 0xE0) == 0xC0) {
+            charLen = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            charLen = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            charLen = 4;
+        }
+        if (i + charLen > len) {
+            break;
+        }
+        String candidate = out + text.substring(i, i + charLen);
+        if (M5.Display.textWidth(candidate) + ellipsisW > maxWidthPx) {
+            break;
+        }
+        out = candidate;
+        i += charLen;
+    }
+    return out + ellipsis;
+}
+
 void drawBootingScreen() {
     const uint16_t bg = M5.Display.color565(14, 24, 46);
     M5.Display.setFont(&fonts::efontJA_12);
@@ -169,9 +203,9 @@ void drawNoticeBannerIfNeeded() {
         return;
     }
     const uint16_t bg = noticeOk ? M5.Display.color565(19, 115, 51) : M5.Display.color565(197, 34, 31);
-    M5.Display.fillRect(0, 138, 80, 22, bg);
-    M5.Display.setFont(&fonts::efontJA_12);
-    drawCenteredText(noticeText.substring(0, 18), 143, TFT_WHITE, bg);
+    M5.Display.fillRect(0, 140, 80, 20, bg);
+    M5.Display.setFont(&fonts::efontJA_10);
+    drawCenteredText(fitTextToWidth(noticeText, 76), 145, TFT_WHITE, bg);
 }
 
 void drawQrScreen() {
@@ -187,7 +221,7 @@ void drawQrScreen() {
         drawCenteredText("QR生成中", 32, TFT_BLACK, TFT_WHITE);
     }
 
-    // 下部 80x80: ステータス・プロファイル・操作ヒント
+    // 下部 80x80: ステータス・プロファイル・IP・操作ヒント
     const bool scanning = (serverStatus == "scanning");
     const uint16_t badgeBg = scanning
         ? M5.Display.color565(26, 115, 232)
@@ -196,20 +230,26 @@ void drawQrScreen() {
     M5.Display.setFont(&fonts::efontJA_12);
     drawCenteredText(scanning ? "スキャン中" : "待機中", 87, TFT_WHITE, badgeBg);
 
-    M5.Display.setTextColor(M5.Display.color565(180, 210, 255), TFT_BLACK);
-    M5.Display.setCursor(4, 108);
-    M5.Display.print(activePresetName.isEmpty() ? "-" : activePresetName);
+    M5.Display.setFont(&fonts::efontJA_10);
+    const String presetLabel = fitTextToWidth(
+        activePresetName.isEmpty() ? "-" : activePresetName,
+        76
+    );
+    drawCenteredText(presetLabel, 108, M5.Display.color565(180, 210, 255), TFT_BLACK);
 
     if (!serverIp.isEmpty()) {
-        M5.Display.setFont(&fonts::Font0);
-        M5.Display.setTextColor(M5.Display.color565(150, 150, 150), TFT_BLACK);
-        M5.Display.setCursor(4, 128);
-        M5.Display.print(serverIp);
+        M5.Display.setFont(&fonts::TomThumb);
+        drawCenteredText(
+            fitTextToWidth(serverIp, 76),
+            126,
+            M5.Display.color565(175, 175, 175),
+            TFT_BLACK
+        );
     }
 
-    M5.Display.setFont(&fonts::efontJA_12);
+    M5.Display.setFont(&fonts::efontJA_10);
     M5.Display.fillRect(0, 142, 80, 18, M5.Display.color565(32, 33, 36));
-    drawCenteredText("A:更新 B:次", 145, M5.Display.color565(220, 220, 220), M5.Display.color565(32, 33, 36));
+    drawCenteredText("A:更新 B:切替", 146, M5.Display.color565(220, 220, 220), M5.Display.color565(32, 33, 36));
     drawNoticeBannerIfNeeded();
 }
 
@@ -222,6 +262,7 @@ void drawPresetScreen() {
     drawCenteredText("プロファイル", 4, TFT_WHITE, headerBg);
 
     if (presets.empty()) {
+        M5.Display.setFont(&fonts::efontJA_10);
         drawCenteredText("読込中...", 68, TFT_LIGHTGREY, TFT_BLACK);
         return;
     }
@@ -233,6 +274,7 @@ void drawPresetScreen() {
     if (start < 0) start = 0;
     if (start + visible > total) start = max(0, total - visible);
 
+    M5.Display.setFont(&fonts::efontJA_10);
     for (int row = 0; row < visible; ++row) {
         const int idx = start + row;
         const int y = 24 + row * 20;
@@ -248,19 +290,19 @@ void drawPresetScreen() {
         }
 
         M5.Display.setTextColor(rowFg, rowBg);
-        M5.Display.setCursor(5, y + 3);
+        M5.Display.setCursor(4, y + 4);
         String prefix = isActive ? "*" : " ";
-        M5.Display.print(prefix + presets[idx].name);
+        M5.Display.print(fitTextToWidth(prefix + presets[idx].name, 72));
     }
 
-    M5.Display.setFont(&fonts::Font0);
-    M5.Display.setTextColor(M5.Display.color565(160, 160, 160), TFT_BLACK);
-    M5.Display.setCursor(4, 128);
-    M5.Display.printf("%d/%d (*:active)", selectedPresetIdx + 1, total);
+    M5.Display.setFont(&fonts::TomThumb);
+    char pageBuf[40];
+    snprintf(pageBuf, sizeof(pageBuf), "%d/%d (*:ACTIVE)", selectedPresetIdx + 1, total);
+    drawCenteredText(String(pageBuf), 129, M5.Display.color565(175, 175, 175), TFT_BLACK);
 
-    M5.Display.setFont(&fonts::efontJA_12);
+    M5.Display.setFont(&fonts::efontJA_10);
     M5.Display.fillRect(0, 142, 80, 18, M5.Display.color565(32, 33, 36));
-    drawCenteredText("A:次/長押確定", 145, M5.Display.color565(220, 220, 220), M5.Display.color565(32, 33, 36));
+    drawCenteredText("A:次/長押確定", 146, M5.Display.color565(220, 220, 220), M5.Display.color565(32, 33, 36));
     drawNoticeBannerIfNeeded();
 }
 
@@ -280,19 +322,20 @@ void drawPowerScreen() {
     M5.Display.fillRect(0, 0, 80, 20, headerBg);
     drawCenteredText("電源オフ", 4, TFT_WHITE, headerBg);
 
+    M5.Display.setFont(&fonts::efontJA_10);
     if (serverStatus == "scanning") {
         drawCenteredText("スキャン中", 52, TFT_YELLOW, TFT_BLACK);
         drawCenteredText("終了後に", 72, TFT_LIGHTGREY, TFT_BLACK);
         drawCenteredText("実行できます", 88, TFT_LIGHTGREY, TFT_BLACK);
     } else {
-        drawCenteredText("DG-CANPC", 36, TFT_WHITE, TFT_BLACK);
-        drawCenteredText("シャットダウン", 52, TFT_WHITE, TFT_BLACK);
-        drawCenteredText("BtnA 2秒長押し", 82, M5.Display.color565(255, 180, 180), TFT_BLACK);
+        drawCenteredText("DG-CANPC", 38, TFT_WHITE, TFT_BLACK);
+        drawCenteredText("シャットダウン", 54, TFT_WHITE, TFT_BLACK);
+        drawCenteredText("BtnA 2秒長押し", 84, M5.Display.color565(255, 180, 180), TFT_BLACK);
         drawPowerProgressBar(0);
     }
 
     M5.Display.fillRect(0, 142, 80, 18, M5.Display.color565(32, 33, 36));
-    drawCenteredText("B:戻る", 145, M5.Display.color565(220, 220, 220), M5.Display.color565(32, 33, 36));
+    drawCenteredText("B:戻る", 146, M5.Display.color565(220, 220, 220), M5.Display.color565(32, 33, 36));
     drawNoticeBannerIfNeeded();
 }
 
@@ -437,6 +480,29 @@ void pollSerial() {
 void handleButtons() {
     if (phase != DevicePhase::Ready) {
         if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
+            wakeScreen();
+        }
+        return;
+    }
+
+    // 画面スリープ（暗転・非表示）中の最初のボタン押下は画面復帰のみ行い、操作は反映しない
+    if (isDimmed) {
+        if (M5.BtnA.wasPressed()) {
+            wakeScreen();
+            swallowBtnAUntilRelease = true;
+            return;
+        }
+        if (M5.BtnB.wasPressed()) {
+            wakeScreen();
+            return;
+        }
+    }
+
+    if (swallowBtnAUntilRelease) {
+        if (M5.BtnA.wasReleased() || !M5.BtnA.isPressed()) {
+            swallowBtnAUntilRelease = false;
+        }
+        if (M5.BtnB.wasPressed()) {
             wakeScreen();
         }
         return;

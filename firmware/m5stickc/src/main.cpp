@@ -63,6 +63,10 @@ int lastPowerBarPx = -1;
 
 uint32_t vbusLostSinceMs = 0;
 String rxBuffer = "";
+bool bootStaticDrawn = false;
+bool shutdownStaticDrawn = false;
+uint32_t rxLineCount = 0;
+uint32_t rxParseErrors = 0;
 
 void wakeScreen() {
     lastActivityMs = millis();
@@ -115,35 +119,49 @@ void drawCenteredText(const String& text, int y, uint16_t color, uint16_t bg) {
 
 void drawBootingScreen() {
     const uint16_t bg = M5.Display.color565(14, 24, 46);
-    M5.Display.fillScreen(bg);
     M5.Display.setFont(&fonts::efontJA_12);
 
-    M5.Display.fillRect(0, 0, 80, 20, M5.Display.color565(26, 115, 232));
-    drawCenteredText("DR-C125", 4, TFT_WHITE, M5.Display.color565(26, 115, 232));
+    if (!bootStaticDrawn) {
+        M5.Display.fillScreen(bg);
+        M5.Display.fillRect(0, 0, 80, 20, M5.Display.color565(26, 115, 232));
+        drawCenteredText("DR-C125", 4, TFT_WHITE, M5.Display.color565(26, 115, 232));
+        drawCenteredText("サーバー", 86, M5.Display.color565(170, 195, 230), bg);
+        drawCenteredText("接続待ち", 102, M5.Display.color565(170, 195, 230), bg);
+        bootStaticDrawn = true;
+    }
 
     String dots = "";
     for (uint8_t i = 0; i < animDots; ++i) dots += ".";
-
+    M5.Display.fillRect(0, 52, 80, 20, bg);
     drawCenteredText("起動中" + dots, 56, TFT_WHITE, bg);
-    drawCenteredText("サーバー", 86, M5.Display.color565(170, 195, 230), bg);
-    drawCenteredText("接続待ち", 102, M5.Display.color565(170, 195, 230), bg);
+
+    if (rxParseErrors > 0) {
+        M5.Display.setFont(&fonts::Font0);
+        M5.Display.fillRect(0, 144, 80, 14, bg);
+        M5.Display.setTextColor(TFT_YELLOW, bg);
+        M5.Display.setCursor(4, 146);
+        M5.Display.printf("RX:%lu E:%lu", static_cast<unsigned long>(rxLineCount), static_cast<unsigned long>(rxParseErrors));
+    }
 }
 
 void drawShuttingDownScreen() {
     const uint16_t bg = M5.Display.color565(56, 12, 12);
-    M5.Display.fillScreen(bg);
     M5.Display.setFont(&fonts::efontJA_12);
 
-    M5.Display.fillRect(0, 0, 80, 20, M5.Display.color565(197, 34, 31));
-    drawCenteredText("POWER", 4, TFT_WHITE, M5.Display.color565(197, 34, 31));
+    if (!shutdownStaticDrawn) {
+        M5.Display.fillScreen(bg);
+        M5.Display.fillRect(0, 0, 80, 20, M5.Display.color565(197, 34, 31));
+        drawCenteredText("POWER", 4, TFT_WHITE, M5.Display.color565(197, 34, 31));
+        drawCenteredText("シャット", 46, TFT_WHITE, bg);
+        drawCenteredText("電源が切れる", 96, M5.Display.color565(255, 205, 205), bg);
+        drawCenteredText("まで待機", 112, M5.Display.color565(255, 205, 205), bg);
+        shutdownStaticDrawn = true;
+    }
 
     String dots = "";
     for (uint8_t i = 0; i < animDots; ++i) dots += ".";
-
-    drawCenteredText("シャット", 46, TFT_WHITE, bg);
+    M5.Display.fillRect(0, 60, 80, 18, bg);
     drawCenteredText("ダウン中" + dots, 62, TFT_WHITE, bg);
-    drawCenteredText("電源が切れる", 96, M5.Display.color565(255, 205, 205), bg);
-    drawCenteredText("まで待機", 112, M5.Display.color565(255, 205, 205), bg);
 }
 
 void drawNoticeBannerIfNeeded() {
@@ -281,12 +299,16 @@ void drawPowerScreen() {
 void renderScreen() {
     switch (phase) {
         case DevicePhase::Booting:
+            shutdownStaticDrawn = false;
             drawBootingScreen();
             break;
         case DevicePhase::ShuttingDown:
+            bootStaticDrawn = false;
             drawShuttingDownScreen();
             break;
         case DevicePhase::Ready:
+            bootStaticDrawn = false;
+            shutdownStaticDrawn = false;
             if (uiMode == UiMode::Qr) {
                 drawQrScreen();
             } else if (uiMode == UiMode::Preset) {
@@ -300,8 +322,13 @@ void renderScreen() {
 }
 
 void handleIncomingJson(const String& line) {
+    rxLineCount++;
     JsonDocument doc;
     if (deserializeJson(doc, line)) {
+        rxParseErrors++;
+        if (phase == DevicePhase::Booting) {
+            needsRedraw = true;
+        }
         return;
     }
 
@@ -505,11 +532,14 @@ void checkAutoPowerOffOnVbusLost() {
 }  // namespace
 
 void setup() {
+    // サーバーからの state JSON (400〜1500B) を取りこぼさないよう、
+    // M5.begin() / Serial.begin() より前に RX バッファを 2048B へ拡張する。
+    Serial.setRxBufferSize(2048);
+
     auto cfg = M5.config();
     cfg.serial_baudrate = SERIAL_BAUD;
     M5.begin(cfg);
 
-    Serial.begin(SERIAL_BAUD);
     M5.Display.setRotation(0);  // 80x160 縦向き
     M5.Display.setBrightness(BRIGHTNESS_ACTIVE);
     M5.Display.setTextWrap(false);
@@ -567,7 +597,8 @@ void loop() {
 
     if (needsRedraw) {
         renderScreen();
+        pollSerial();
     }
 
-    delay(15);
+    delay(5);
 }

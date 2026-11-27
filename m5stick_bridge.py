@@ -176,17 +176,23 @@ class M5StickBridge:
         self._ser: Any = None
         self._thread: threading.Thread | None = None
         self._connected_port: str | None = None
+        self._last_error: str | None = None
 
     @property
     def connected_port(self) -> str | None:
         return self._connected_port
 
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
     def start(self) -> None:
         if os.environ.get("M5STICK_ENABLED", "1").strip().lower() in {"0", "false", "off"}:
-            logger.info("M5StickC ブリッジは環境変数により無効化されています。")
+            logger.warning("M5StickC ブリッジは環境変数により無効化されています。")
             return
         if serial is None:
-            logger.info("pyserial が未導入のため M5StickC ブリッジをスキップします。")
+            self._last_error = "pyserial が未導入です (uv sync を実行してください)"
+            logger.warning("M5StickC ブリッジを起動できません: %s", self._last_error)
             return
         if self._thread and self._thread.is_alive():
             return
@@ -300,23 +306,35 @@ class M5StickBridge:
 
     def _run_loop(self) -> None:
         last_sent = 0.0
+        last_logged_err: str | None = None
         while not self._stop_event.is_set():
             if self._ser is None:
                 port = find_m5stick_port()
                 if not port:
+                    err = "M5StickC のシリアルポート (/dev/ttyUSB* 等) が見つかりません"
+                    self._last_error = err
+                    if err != last_logged_err:
+                        logger.warning("%s", err)
+                        last_logged_err = err
                     self._stop_event.wait(RECONNECT_INTERVAL_SEC)
                     continue
                 try:
                     ser = self._open_serial(port)
                 except Exception as exc:
-                    logger.debug("M5StickC シリアル接続待機中 (%s): %s", port, exc)
+                    err = f"M5StickC シリアル接続失敗 ({port}): {exc}"
+                    self._last_error = err
+                    if err != last_logged_err:
+                        logger.warning("%s", err)
+                        last_logged_err = err
                     self._stop_event.wait(RECONNECT_INTERVAL_SEC)
                     continue
 
                 with self._write_lock:
                     self._ser = ser
                     self._connected_port = port
-                logger.info("M5StickC に接続しました: %s", port)
+                self._last_error = None
+                last_logged_err = None
+                logger.warning("M5StickC に接続しました: %s", port)
                 last_sent = 0.0
                 self._wake_event.set()
 

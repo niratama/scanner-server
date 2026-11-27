@@ -556,11 +556,8 @@ void handleButtons() {
             }
             if (!btnAHoldTriggered && heldMs >= POWEROFF_HOLD_MS) {
                 btnAHoldTriggered = true;
-                shutdownReason = "poweroff";
-                phase = DevicePhase::ShuttingDown;
-                vbusLostSinceMs = 0;
                 sendCommand("poweroff");
-                needsRedraw = true;
+                showNotice("電源オフ要求", true);
             }
         }
     }

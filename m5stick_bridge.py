@@ -205,12 +205,12 @@ class M5StickBridge:
         self._thread.start()
 
     def stop(self, *, shutdown_reason: str = "restart") -> None:
-        """サーバー終了時にシャットダウン画面通知を送ってからクローズする。"""
-        self.send_shutdown(reason=shutdown_reason)
+        """ループを停止してからシャットダウン画面通知を送り、シリアルをクローズする。"""
         self._stop_event.set()
         self._wake_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        self.send_shutdown(reason=shutdown_reason)
         self._close_serial()
 
     def notify_state_changed(self) -> None:

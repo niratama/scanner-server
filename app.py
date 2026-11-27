@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import subprocess
+import threading
 from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlparse
@@ -34,6 +35,7 @@ STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 LOCALHOST_CLIENTS = {"127.0.0.1", "::1", "localhost"}
 
 scan_lock = asyncio.Lock()
+_poweroff_lock = threading.Lock()
 state = {
     "running": False,
     "powering_off": False,
@@ -62,15 +64,18 @@ def _build_m5_state() -> dict:
     )
 
 
-def _schedule_poweroff() -> tuple[bool, str]:
-    if scan_lock.locked() or state["running"]:
-        return False, "スキャン実行中のためシャットダウンできません"
-    if state["powering_off"]:
-        return False, "すでにシャットダウン処理中です"
+def _schedule_poweroff(*, notify_m5: bool = True) -> tuple[bool, str]:
+    with _poweroff_lock:
+        if scan_lock.locked() or state["running"]:
+            return False, "スキャン実行中のためシャットダウンできません"
+        if state["powering_off"]:
+            return False, "すでにシャットダウン処理中です"
 
-    state["powering_off"] = True
-    state["message"] = "シャットダウン処理中..."
-    m5_bridge.send_shutdown(reason="poweroff")
+        state["powering_off"] = True
+        state["message"] = "シャットダウン処理中..."
+
+    if notify_m5:
+        m5_bridge.send_shutdown(reason="poweroff")
 
     async def _do_poweroff():
         await asyncio.sleep(1.5)
@@ -92,6 +97,11 @@ def _schedule_poweroff() -> tuple[bool, str]:
     return True, "シャットダウンを開始しました"
 
 
+def _on_m5_poweroff() -> tuple[bool, str]:
+    # M5StickBridge.handle_incoming_line 側で shutdown パケットを返信するため二重送信を防ぐ
+    return _schedule_poweroff(notify_m5=False)
+
+
 def _on_m5_refresh_qr() -> None:
     auth_manager.get_qr_token(force_rotate=True)
 
@@ -108,7 +118,7 @@ m5_bridge = M5StickBridge(
     get_state_fn=_build_m5_state,
     on_refresh_qr=_on_m5_refresh_qr,
     on_select_preset=_on_m5_select_preset,
-    on_poweroff=_schedule_poweroff,
+    on_poweroff=_on_m5_poweroff,
 )
 
 
@@ -150,10 +160,12 @@ def _is_https_request(request: Request) -> bool:
     return request.url.scheme == "https" or forwarded_proto == "https"
 
 
-def _apply_security_headers(response):
+def _apply_security_headers(response, *, no_store: bool = False):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if no_store:
+        response.headers.setdefault("Cache-Control", "no-store")
     if "text/html" in response.headers.get("content-type", ""):
         response.headers.setdefault(
             "Content-Security-Policy",
@@ -234,20 +246,27 @@ AUTH_EXPIRED_HTML = _render_auth_page(
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     path = request.url.path
+    is_auth_path = path.startswith(("/a/", "/api/auth/"))
 
     if request.method in STATE_CHANGING_METHODS:
         if not request.headers.get("x-requested-with"):
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "不正なリクエストです（CSRF 保護）"},
+            return _apply_security_headers(
+                JSONResponse(
+                    status_code=403,
+                    content={"detail": "不正なリクエストです（CSRF 保護）"},
+                ),
+                no_store=is_auth_path,
             )
         origin = request.headers.get("origin")
         if origin:
             host = request.headers.get("host", "")
             if urlparse(origin).netloc != host:
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "クロスオリジンリクエストは許可されていません"},
+                return _apply_security_headers(
+                    JSONResponse(
+                        status_code=403,
+                        content={"detail": "クロスオリジンリクエストは許可されていません"},
+                    ),
+                    no_store=is_auth_path,
                 )
 
     if is_auth_enabled():
@@ -267,10 +286,10 @@ async def security_middleware(request: Request, call_next):
                     )
                 else:
                     response = HTMLResponse(content=AUTH_REQUIRED_HTML, status_code=401)
-                return _apply_security_headers(response)
+                return _apply_security_headers(response, no_store=True)
 
     response = await call_next(request)
-    return _apply_security_headers(response)
+    return _apply_security_headers(response, no_store=is_auth_path)
 
 
 class ScanSettings(BaseModel):

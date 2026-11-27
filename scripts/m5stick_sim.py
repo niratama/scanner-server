@@ -188,6 +188,10 @@ class M5StickSimulator:
                     self.status = "idle"
                     self.heartbeat_enabled = True
                     self.send_json(self.build_state())
+                elif cmd == "offline":
+                    self.status = "offline"
+                    self.heartbeat_enabled = True
+                    self.send_json(self.build_state())
                 elif cmd == "scan":
                     self.status = "scanning"
                     self.heartbeat_enabled = True
@@ -236,6 +240,7 @@ class M5StickSimulator:
             """
 コマンド一覧:
   idle             待機中状態を送信
+  offline          スキャナ電源OFF状態を送信
   scan             スキャン中状態を送信（電源オフのロック確認）
   qr               QR トークンを手動更新
   ip <IP>          表示 IP を変更（例: ip 192.168.100.123）

@@ -217,6 +217,23 @@ class TestDriveClient(unittest.TestCase):
 
 
 class TestScanPipeline(unittest.TestCase):
+    def test_is_scanner_online_via_sysfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertFalse(scan_pipeline.is_scanner_online(sysfs_root=root))
+
+            other = root / "1-1"
+            other.mkdir()
+            (other / "idVendor").write_text("0403\n", encoding="ascii")
+            (other / "idProduct").write_text("6001\n", encoding="ascii")
+            self.assertFalse(scan_pipeline.is_scanner_online(sysfs_root=root))
+
+            canon = root / "1-2"
+            canon.mkdir()
+            (canon / "idVendor").write_text("1083\n", encoding="ascii")
+            (canon / "idProduct").write_text("1640\n", encoding="ascii")
+            self.assertTrue(scan_pipeline.is_scanner_online(sysfs_root=root))
+
     def test_build_scanimage_cmd_defaults(self):
         cmd = scan_pipeline.build_scanimage_cmd(batch_pattern="/tmp/page_%04d.jpg")
         self.assertEqual(cmd[0], "scanimage")

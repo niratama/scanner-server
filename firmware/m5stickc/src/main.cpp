@@ -223,12 +223,19 @@ void drawQrScreen() {
 
     // 下部 80x80: ステータス・プロファイル・IP・操作ヒント
     const bool scanning = (serverStatus == "scanning");
-    const uint16_t badgeBg = scanning
-        ? M5.Display.color565(26, 115, 232)
-        : M5.Display.color565(19, 115, 51);
+    const bool offline = (serverStatus == "offline");
+    uint16_t badgeBg = M5.Display.color565(19, 115, 51);
+    const char* badgeText = "待機中";
+    if (scanning) {
+        badgeBg = M5.Display.color565(26, 115, 232);
+        badgeText = "スキャン中";
+    } else if (offline) {
+        badgeBg = M5.Display.color565(180, 96, 0);
+        badgeText = "スキャナOFF";
+    }
     M5.Display.fillRoundRect(4, 84, 72, 18, 4, badgeBg);
-    M5.Display.setFont(&fonts::efontJA_12);
-    drawCenteredText(scanning ? "スキャン中" : "待機中", 87, TFT_WHITE, badgeBg);
+    M5.Display.setFont(&fonts::efontJA_10);
+    drawCenteredText(badgeText, 88, TFT_WHITE, badgeBg);
 
     M5.Display.setFont(&fonts::efontJA_10);
     const String presetLabel = fitTextToWidth(

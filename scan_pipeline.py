@@ -1,4 +1,5 @@
 import datetime
+import os
 import re
 import shutil
 import subprocess
@@ -14,6 +15,40 @@ from drive_client import ensure_subfolder, get_drive_service, upload_file, uploa
 JOBS_ROOT = Path("/tmp/dr_c125_jobs")
 SCANIMAGE_TIMEOUT_SECONDS = 600
 MAX_BASE_NAME_LENGTH = 100
+DEFAULT_SCANNER_USB_ID = "1083:1640"
+SYSFS_USB_DEVICES = Path("/sys/bus/usb/devices")
+
+
+def is_scanner_online(
+    *,
+    usb_id: str | None = None,
+    sysfs_root: Path = SYSFS_USB_DEVICES,
+) -> bool:
+    """Linux sysfs から Canon DR-C125 (1083:1640) の電源 ON/USB 接続状態を判定する。"""
+    raw_id = (usb_id or os.environ.get("SCANNER_USB_ID", DEFAULT_SCANNER_USB_ID)).strip().lower()
+    if ":" not in raw_id:
+        return False
+    target_vid, target_pid = raw_id.split(":", 1)
+    if not sysfs_root.is_dir():
+        return False
+    try:
+        entries = list(sysfs_root.iterdir())
+    except OSError:
+        return False
+
+    for dev_dir in entries:
+        vid_path = dev_dir / "idVendor"
+        pid_path = dev_dir / "idProduct"
+        if not (vid_path.is_file() and pid_path.is_file()):
+            continue
+        try:
+            vid = vid_path.read_text(encoding="ascii").strip().lower()
+            pid = pid_path.read_text(encoding="ascii").strip().lower()
+        except OSError:
+            continue
+        if vid == target_vid and pid == target_pid:
+            return True
+    return False
 
 BLANK_SENSITIVITY_MAP: dict[str, tuple[int, float]] = {
     "low": (200, 0.0010),

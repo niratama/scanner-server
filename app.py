@@ -18,7 +18,7 @@ from drive_client import (
 )
 from history_store import append_history, clear_history, load_history
 from m5stick_bridge import M5StickBridge, build_state_payload
-from scan_pipeline import run_scan_job
+from scan_pipeline import is_scanner_online, run_scan_job
 from settings_store import (
     delete_custom_preset,
     get_settings_payload,
@@ -48,6 +48,8 @@ def _current_m5_status() -> str:
         return "powering_off"
     if state["running"]:
         return "scanning"
+    if not is_scanner_online():
+        return "offline"
     return "idle"
 
 
@@ -434,6 +436,7 @@ async def get_status():
     return {
         "running": state["running"],
         "powering_off": state["powering_off"],
+        "scanner_online": is_scanner_online(),
         "message": state["message"],
         "last_error": state["last_error"],
         "button_preset_id": settings["button_preset_id"],
@@ -1112,7 +1115,10 @@ HTML_UI = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>DR-C125 ネットワークスキャナー</h1>
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;">
+    <h1 style="margin:0;">DR-C125 ネットワークスキャナー</h1>
+    <span id="scannerPowerBadge" class="badge" style="white-space:nowrap;">確認中...</span>
+  </div>
 
   <div class="card">
     <div id="statusBox" class="status" role="status" aria-live="polite">待機中</div>
@@ -1720,10 +1726,24 @@ async function fetchStatus() {
     if (!res.ok) return;
     const data = await res.json();
     const busy = Boolean(data.running || data.powering_off);
-    document.getElementById('statusBox').textContent = data.message;
-    document.getElementById('scanBtn').disabled = busy;
+    const scannerOnline = data.scanner_online !== false;
+    const powerBadge = document.getElementById('scannerPowerBadge');
+    if (scannerOnline) {
+      powerBadge.textContent = 'スキャナー ON';
+      powerBadge.style.background = '#e6f4ea';
+      powerBadge.style.color = '#137333';
+    } else {
+      powerBadge.textContent = 'スキャナー OFF';
+      powerBadge.style.background = '#fef7e0';
+      powerBadge.style.color = '#b06000';
+    }
+    const statusText = (!busy && !scannerOnline)
+      ? `${data.message}（スキャナーの電源が OFF です）`
+      : data.message;
+    document.getElementById('statusBox').textContent = statusText;
+    document.getElementById('scanBtn').disabled = busy || !scannerOnline;
     document.getElementById('powerBtn').disabled = busy;
-    document.getElementById('testButtonTriggerBtn').disabled = busy;
+    document.getElementById('testButtonTriggerBtn').disabled = busy || !scannerOnline;
     if (data.button_preset_id && data.button_preset_id !== buttonPresetId) {
       buttonPresetId = data.button_preset_id;
       const sel = document.getElementById('buttonPresetSelect');

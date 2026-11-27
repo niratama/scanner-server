@@ -27,10 +27,14 @@
   - `drive.file` スコープのまま、`DR-C125_Scans` 配下のサブフォルダ一覧取得・選択・新規作成（`2026/領収書` のような階層指定にも対応）が可能。
 - **安全なリモートシャットダウン**
   - スキャン実行中は多重実行・シャットダウンをロックで防止し、完了後に確認ダイアログ経由で `systemctl poweroff` を実行可能。
+- **スキャナー電源 ON/OFF 検知**
+  - Linux `sysfs`（USB ID `1083:1640`）を直接参照することで USB 競合なく DR-C125 の電源状態をリアルタイム判定。
+  - 電源 OFF 時はスマホ UI 上部に「スキャナー OFF」バッジを表示してスキャンボタンを無効化し、M5StickC にもオレンジ色の「スキャナOFF」バッジを表示。
 - **M5StickC 連携（QR コード認証・プロファイル切替・シャットダウン）**
   - DG-CANPC に USB シリアル直結した初代 M5StickC（80×160）にワンタイム認証 QR コードを表示し、スマホで読み取るだけで 30 日有効な HttpOnly セッション Cookie を発行。
   - スマホ UI からいつでもセッションの 30 日延長（更新）・ログアウトが可能。
   - M5StickC 本体ボタンから本体スタートボタン用プロファイルの切り替えと安全シャットダウン（2 秒長押し）に対応。
+  - 無操作 60 秒で画面消灯（スリープ）し、復帰時の最初の 1 押しは画面点灯のみで誤操作を防止。
   - サーバー起動前は「起動中」画面、サーバー終了〜電源断までは「シャットダウン中」画面を表示（USB 給電断を検知して M5StickC 自身も自動電源オフ）。
 
 ---
@@ -75,6 +79,7 @@
 ├── scripts/
 │   ├── setup.sh              # 自動セットアップスクリプト（OS 最適化・SANE・uv・systemd・scanbd）
 │   ├── button_trigger.sh     # scanbd から呼び出す本体ボタン連動スクリプト
+│   ├── m5stick_sim.py        # WSL / 開発環境向け M5StickC シリアル接続シミュレーター
 │   └── scanbd_canon_dr.conf  # scanbd 用 Canon DR-C125 設定サンプル
 ├── tests/
 │   └── test_scanner.py  # ユニットテスト
@@ -256,9 +261,16 @@ sudo ufw allow 8000/tcp
      - `電源オフ`: 2 秒長押しで DG-CANPC を安全シャットダウン
 4. 主な環境変数（任意）:
    - `SCANNER_AUTH_ENABLED`: `1`（既定・QR 認証有効）/ `0`（緊急・開発用に認証無効化）
+   - `SCANNER_USB_ID`: 電源検知するスキャナーの USB ID（既定: `1083:1640`）
    - `M5STICK_ENABLED`: `1`（既定）/ `0`（シリアルブリッジ無効化）
    - `M5STICK_PORT`: シリアルポートを明示指定（既定は `/dev/ttyUSB*` 等を自動検出）
    - `SCANNER_BASE_URL`: QR コードに埋め込むベース URL を明示指定（既定は LAN IP と `SCANNER_PORT` から自動生成）
+5. WSL / 開発環境での単体テスト（シミュレーター）:
+   - DG-CANPC 実機なしで M5StickC の各画面（待機中 / スキャナOFF / スキャン中 / シャットダウン中 / ハートビート断）を対話的に検証できます。
+   ```bash
+   uv run python scripts/m5stick_sim.py --list-ports
+   uv run python scripts/m5stick_sim.py --ip 192.168.100.123
+   ```
 
 ---
 
@@ -273,7 +285,7 @@ sudo ufw allow 8000/tcp
 | `POST` | `/api/auth/logout` | 現在のセッションを破棄してログアウト |
 | `POST` | `/api/scan` | スキャンジョブを開始（前回設定を自動保存） |
 | `POST` | `/api/trigger/button` | 本体ボタン用に選択済みプリセットでスキャンを実行（`?wait=true` で完了待機） |
-| `GET` | `/api/status` | 実行状態・進捗メッセージ・エラー・直近 20 件の履歴を取得 |
+| `GET` | `/api/status` | 実行状態・スキャナー電源状態・進捗メッセージ・エラー・直近 20 件の履歴を取得 |
 | `GET` | `/api/history` | サーバー保存済みのスキャン履歴を取得（`?limit=50`） |
 | `DELETE` | `/api/history` | サーバー保存済みのスキャン履歴をクリア |
 | `GET` | `/api/settings` | 既定値・前回設定・組み込み／カスタムプリセット・本体ボタン設定を取得 |

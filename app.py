@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import subprocess
-import threading
 from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlparse
@@ -35,7 +34,6 @@ STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 LOCALHOST_CLIENTS = {"127.0.0.1", "::1", "localhost"}
 
 scan_lock = asyncio.Lock()
-_poweroff_lock = threading.Lock()
 state = {
     "running": False,
     "powering_off": False,
@@ -64,15 +62,15 @@ def _build_m5_state() -> dict:
     )
 
 
-def _schedule_poweroff(*, notify_m5: bool = True) -> tuple[bool, str]:
-    with _poweroff_lock:
-        if scan_lock.locked() or state["running"]:
-            return False, "スキャン実行中のためシャットダウンできません"
-        if state["powering_off"]:
-            return False, "すでにシャットダウン処理中です"
+async def _schedule_poweroff(*, notify_m5: bool = True) -> tuple[bool, str]:
+    """イベントループスレッド上でスキャンロック確認とシャットダウン予約を行う。"""
+    if scan_lock.locked() or state["running"]:
+        return False, "スキャン実行中のためシャットダウンできません"
+    if state["powering_off"]:
+        return False, "すでにシャットダウン処理中です"
 
-        state["powering_off"] = True
-        state["message"] = "シャットダウン処理中..."
+    state["powering_off"] = True
+    state["message"] = "シャットダウン処理中..."
 
     if notify_m5:
         m5_bridge.send_shutdown(reason="poweroff")
@@ -85,21 +83,21 @@ def _schedule_poweroff(*, notify_m5: bool = True) -> tuple[bool, str]:
             check=False,
         )
 
-    loop = _app_loop
-    try:
-        running_loop = asyncio.get_running_loop()
-        running_loop.create_task(_do_poweroff())
-    except RuntimeError:
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(_do_poweroff()))
-        else:
-            subprocess.Popen(["sudo", "-n", "/usr/bin/systemctl", "poweroff"])
+    asyncio.create_task(_do_poweroff())
     return True, "シャットダウンを開始しました"
 
 
 def _on_m5_poweroff() -> tuple[bool, str]:
-    # M5StickBridge.handle_incoming_line 側で shutdown パケットを返信するため二重送信を防ぐ
-    return _schedule_poweroff(notify_m5=False)
+    """M5StickC 受信スレッドからの poweroff 要求をイベントループスレッドへ委譲する。"""
+    loop = _app_loop
+    if loop is None or not loop.is_running():
+        return False, "サーバー準備中です"
+    future = asyncio.run_coroutine_threadsafe(_schedule_poweroff(notify_m5=False), loop)
+    try:
+        return future.result(timeout=2.0)
+    except Exception as exc:
+        logger.warning("M5StickC からのシャットダウン要求処理に失敗しました: %s", exc)
+        return False, "シャットダウン要求の処理に失敗しました"
 
 
 def _on_m5_refresh_qr() -> None:
@@ -652,7 +650,7 @@ async def logout_auth_session(request: Request):
 
 @app.post("/api/poweroff")
 async def poweroff():
-    ok, detail = _schedule_poweroff()
+    ok, detail = await _schedule_poweroff()
     if not ok:
         raise HTTPException(status_code=409, detail=detail)
     return {"status": "powering_off"}

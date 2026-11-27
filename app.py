@@ -134,6 +134,23 @@ def _is_local_request(request: Request) -> bool:
     return bool(client and client.host in LOCALHOST_CLIENTS)
 
 
+def _is_https_request(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or forwarded_proto == "https"
+
+
+def _apply_security_headers(response):
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if "text/html" in response.headers.get("content-type", ""):
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'",
+        )
+    return response
+
+
 def _render_auth_page(title: str, lead: str, sub: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -239,21 +256,10 @@ async def security_middleware(request: Request, call_next):
                     )
                 else:
                     response = HTMLResponse(content=AUTH_REQUIRED_HTML, status_code=401)
-                response.headers.setdefault("X-Frame-Options", "DENY")
-                response.headers.setdefault("X-Content-Type-Options", "nosniff")
-                response.headers.setdefault("Referrer-Policy", "no-referrer")
-                return response
+                return _apply_security_headers(response)
 
     response = await call_next(request)
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    if "text/html" in response.headers.get("content-type", ""):
-        response.headers.setdefault(
-            "Content-Security-Policy",
-            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'",
-        )
-    return response
+    return _apply_security_headers(response)
 
 
 class ScanSettings(BaseModel):
@@ -530,7 +536,7 @@ async def add_folder(req: FolderCreateRequest):
 
 
 @app.get("/a/{token}")
-async def qr_login(token: str):
+async def qr_login(token: str, request: Request):
     """M5StickC に表示されたワンタイム QR トークンで 30 日セッション Cookie を発行する。"""
     if not is_auth_enabled():
         return RedirectResponse(url="/", status_code=303)
@@ -544,6 +550,7 @@ async def qr_login(token: str):
         value=session["token"],
         max_age=session["max_age"],
         httponly=True,
+        secure=_is_https_request(request),
         samesite="lax",
         path="/",
     )
@@ -597,6 +604,7 @@ async def refresh_auth_session(request: Request):
         value=refreshed["token"],
         max_age=refreshed["max_age"],
         httponly=True,
+        secure=_is_https_request(request),
         samesite="lax",
         path="/",
     )

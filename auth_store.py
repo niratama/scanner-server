@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import tempfile
@@ -92,12 +93,21 @@ class AuthManager:
                 isinstance(token_hash, str)
                 and len(token_hash) == 64
                 and isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                and math.isfinite(expires_at)
                 and expires_at > now
             ):
+                safe_created_at = (
+                    float(created_at)
+                    if isinstance(created_at, (int, float))
+                    and not isinstance(created_at, bool)
+                    and math.isfinite(created_at)
+                    else now
+                )
                 valid.append(
                     {
                         "hash": token_hash,
-                        "created_at": float(created_at),
+                        "created_at": safe_created_at,
                         "expires_at": float(expires_at),
                     }
                 )

@@ -398,6 +398,27 @@ class TestAuthStore(unittest.TestCase):
             clock[0] += 101
             self.assertIsNone(mgr.verify_session(session["token"]))
 
+    def test_corrupted_created_at_does_not_crash_session_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_path = Path(tmp) / "auth_sessions.json"
+            clock = [1_700_000_000.0]
+            raw_token = "valid-session-token"
+            token_hash = auth_store._hash_token(raw_token)
+            sessions_path.write_text(
+                (
+                    '{"sessions": ['
+                    f'{{"hash": "{token_hash}", "created_at": "invalid", "expires_at": {clock[0] + 600}}},'
+                    f'{{"hash": "{token_hash}", "created_at": 123, "expires_at": true}}'
+                    "]}"
+                ),
+                encoding="utf-8",
+            )
+            mgr = auth_store.AuthManager(sessions_path, now_fn=lambda: clock[0])
+            info = mgr.verify_session(raw_token)
+            self.assertIsNotNone(info)
+            self.assertEqual(info["created_at"], clock[0])
+            self.assertEqual(info["active_sessions"], 1)
+
 
 class TestM5StickBridge(unittest.TestCase):
     def test_build_state_payload_and_command_handling(self):
